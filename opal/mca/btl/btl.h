@@ -641,6 +641,23 @@ typedef int (*mca_btl_base_module_del_procs_fn_t)(
 );
 
 /**
+ * Check if a process is reachable using the BTL module
+ *
+ * @param btl (IN)       BTL module
+ * @param proc (IN)      Opal process
+ * @param flags (IN,OUT) Reachability flags
+ *
+ * This function can be used to check if a particular opal process is
+ * reachable using a BTL module. It is up to BTL implementors to implement
+ * this function is a scaleable way. flags may be any combination of
+ * MCA_BTL_FLAGS_SEND, MCA_BTL_FLAGS_PUT, MCA_BTL_FLAGS_GET,
+ * MCA_BTL_FLAGS_CUDA_PUT, MCA_BTL_FLAGS_CUDA_GET, MCA_BTL_FLAGS_ATOMIC_OPS,
+ * or MCA_BTL_FLAGS_ATOMIC_FOPS.
+ */
+typedef bool (*mca_btl_base_module_reachable_fn_t) (struct mca_btl_base_module_t *module,
+                                                    struct opal_proc_t *proc, int *flags);
+
+/**
  * Register a callback function that is called on receipt
  * of a fragment.
  *
@@ -1139,6 +1156,9 @@ struct mca_btl_base_module_t {
     /* BTL function table */
     mca_btl_base_module_add_procs_fn_t      btl_add_procs;
     mca_btl_base_module_del_procs_fn_t      btl_del_procs;
+
+    mca_btl_base_module_reachable_fn_t      btl_reachable;
+
     mca_btl_base_module_register_fn_t       btl_register;
     mca_btl_base_module_finalize_fn_t       btl_finalize;
 
