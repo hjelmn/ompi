@@ -128,6 +128,13 @@ OPAL_DECLSPEC extern int (*opal_convert_string_to_process_name)(opal_process_nam
 OPAL_DECLSPEC extern char* (*opal_vpid_print)(const opal_vpid_t);
 OPAL_DECLSPEC extern char* (*opal_jobid_print)(const opal_jobid_t);
 
+/**
+ * Lookup an opal_proc_t by name
+ *
+ * @param name (IN) name to lookup
+ */
+OPAL_DECLSPEC extern struct opal_proc_t *(*opal_proc_for_name) (const opal_process_name_t name);
+
 #define OPAL_NAME_PRINT(OPAL_PN)    opal_process_name_print(OPAL_PN)
 
 /* provide a safe way to retrieve the hostname of a proc, including

@@ -145,10 +145,16 @@ static int opal_convert_string_to_process_name_should_never_be_called(opal_proce
     return OPAL_ERR_NOT_SUPPORTED;
 }
 
+static struct opal_proc_t *opal_proc_for_name_should_never_be_called (opal_process_name_t name)
+{
+    return NULL;
+}
+
 char* (*opal_process_name_print)(const opal_process_name_t) = opal_process_name_print_should_never_be_called;
 char* (*opal_vpid_print)(const opal_vpid_t) = opal_vpid_print_should_never_be_called;
 char* (*opal_jobid_print)(const opal_jobid_t) = opal_jobid_print_should_never_be_called;
 int (*opal_convert_string_to_process_name)(opal_process_name_t *name, const char* name_string) = opal_convert_string_to_process_name_should_never_be_called;
+struct opal_proc_t *(*opal_proc_for_name) (const opal_process_name_t name) = opal_proc_for_name_should_never_be_called;
 
 char* opal_get_proc_hostname(const opal_proc_t *proc)
 {

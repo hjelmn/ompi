@@ -10,7 +10,7 @@
  * Copyright (c) 2004-2006 The Regents of the University of California.
  *                         All rights reserved.
  * Copyright (c) 2006-2014 Cisco Systems, Inc.  All rights reserved.
- * Copyright (c) 2012      Los Alamos National Security, LLC.  All rights
+ * Copyright (c) 2012-2015 Los Alamos National Security, LLC.  All rights
  *                         reserved. 
  * Copyright (c) 2013-2014 Intel, Inc. All rights reserved
  * Copyright (c) 2014      Research Organization for Information Science
@@ -44,6 +44,8 @@
 
 static opal_list_t  ompi_proc_list;
 static opal_mutex_t ompi_proc_lock;
+static opal_hash_table_t ompi_proc_hash;
+
 ompi_proc_t* ompi_proc_local_proc = NULL;
 
 static void ompi_proc_construct(ompi_proc_t* proc);
@@ -84,43 +86,211 @@ void ompi_proc_destruct(ompi_proc_t* proc)
     }
     OPAL_THREAD_LOCK(&ompi_proc_lock);
     opal_list_remove_item(&ompi_proc_list, (opal_list_item_t*)proc);
+    opal_hash_table_remove_value_ptr (&ompi_proc_hash, &proc->super.proc_name, sizeof (proc->super.proc_name));
     OPAL_THREAD_UNLOCK(&ompi_proc_lock);
 }
 
+/**
+ * Allocate a new ompi_proc_T for the given jobid/vpid
+ *
+ * @param[in]  jobid Job identifier
+ * @param[in]  vpid  Process identifier
+ * @param[out] procp New ompi_proc_t structure
+ *
+ * This function allocates a new ompi_proc_t and inserts it into
+ * the process list and hash table.
+ */
+static int ompi_proc_allocate (ompi_jobid_t jobid, ompi_vpid_t vpid, ompi_proc_t **procp) {
+    ompi_proc_t *proc = OBJ_NEW(ompi_proc_t);
+
+    opal_list_append(&ompi_proc_list, (opal_list_item_t*)proc);
+
+    OMPI_CAST_RTE_NAME(&proc->super.proc_name)->jobid = jobid;
+    OMPI_CAST_RTE_NAME(&proc->super.proc_name)->vpid = vpid;
+
+    opal_hash_table_set_value_ptr (&ompi_proc_hash, &proc->super.proc_name, sizeof (proc->super.proc_name),
+                                   ompi_proc_local_proc);
+
+    *procp = proc;
+
+    return OMPI_SUCCESS;
+}
+
+/**
+ * Finish setting up an ompi_proc_t
+ *
+ * @param[in] proc ompi process structure
+ *
+ * This function contains the core code of ompi_proc_complete_init() and
+ * ompi_proc_refresh(). The tasks performed by this function include
+ * retrieving the hostname (if below the modex cutoff), determining the
+ * remote architecture, and calculating the locality of the process.
+ */
+static int ompi_proc_complete_init_single (ompi_proc_t *proc)
+{
+    opal_list_t myvals;
+    opal_value_t *kv;
+    int ret;
+
+    if (OMPI_CAST_RTE_NAME(&proc->super.proc_name)->vpid == OMPI_PROC_MY_NAME->vpid) {
+        /* nothing else to do */
+        return OMPI_SUCCESS;
+    }
+
+    /* get the locality information - do not use modex recv for
+     * this request as that will automatically cause the hostname
+     * to be loaded as well. All RTEs are required to provide this
+     * information at startup for procs on our node. Thus, not
+     * finding the info indicates that the proc is non-local.
+     */
+    OBJ_CONSTRUCT(&myvals, opal_list_t);
+    if (OMPI_SUCCESS != (ret = opal_dstore.fetch(opal_dstore_internal,
+                                                 &proc->super.proc_name,
+                                                 OPAL_DSTORE_LOCALITY, &myvals))) {
+        proc->super.proc_flags = OPAL_PROC_NON_LOCAL;
+    } else {
+        kv = (opal_value_t*)opal_list_get_first(&myvals);
+        proc->super.proc_flags = kv->data.uint16;
+    }
+    OPAL_LIST_DESTRUCT(&myvals);
+
+    if (ompi_process_info.num_procs < ompi_direct_modex_cutoff) {
+        /* IF the number of procs falls below the specified cutoff,
+         * then we assume the job is small enough that retrieving
+         * the hostname (which will typically cause retrieval of
+         * ALL modex info for this proc) will have no appreciable
+         * impact on launch scaling
+         */
+        OPAL_MODEX_RECV_VALUE(ret, OPAL_DSTORE_HOSTNAME, (opal_proc_t*)&proc->super,
+                              (char**)&(proc->super.proc_hostname), OPAL_STRING);
+        if (OPAL_SUCCESS != ret) {
+            return ret;
+        }
+    } else {
+        /* just set the hostname to NULL for now - we'll fill it in
+         * as modex_recv's are called for procs we will talk to, thus
+         * avoiding retrieval of ALL modex info for this proc until
+         * required. Transports that delay calling modex_recv until
+         * first message will therefore scale better than those that
+         * call modex_recv on all procs during init.
+         */
+        proc->super.proc_hostname = NULL;
+    }
+#if OPAL_ENABLE_HETEROGENEOUS_SUPPORT
+    /* get the remote architecture - this might force a modex except
+     * for those environments where the RM provides it */
+    {
+        uint32_t *ui32ptr;
+        ui32ptr = &(proc->super.proc_arch);
+        OPAL_MODEX_RECV_VALUE(ret, OPAL_DSTORE_ARCH, (opal_proc_t*)&proc->super,
+                              (void**)&ui32ptr, OPAL_UINT32);
+        if (OPAL_SUCCESS == ret) {
+            /* if arch is different than mine, create a new convertor for this proc */
+            if (proc->super.proc_arch != opal_local_arch) {
+                OBJ_RELEASE(proc->super.proc_convertor);
+                proc->super.proc_convertor = opal_convertor_create(proc->super.proc_arch, 0);
+            }
+        } else if (OMPI_ERR_NOT_IMPLEMENTED == ret) {
+            proc->super.proc_arch = opal_local_arch;
+        } else {
+            return ret;
+        }
+    }
+#else
+    /* must be same arch as my own */
+    proc->super.proc_arch = opal_local_arch;
+#endif
+
+    return OMPI_SUCCESS;
+}
+
+opal_proc_t *ompi_proc_for_name (const opal_process_name_t proc_name)
+{
+    ompi_proc_t *proc = NULL;
+    int ret;
+
+    /* try to lookup the value in the hash table */
+    ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) proc);
+    if (OPAL_SUCCESS == ret) {
+        return &proc->super;
+    }
+
+    OPAL_THREAD_LOCK(&ompi_proc_lock);
+    do {
+        /* double-check that another competing thread has not added this proc */
+        ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) proc);
+        if (OPAL_SUCCESS == ret) {
+            break;
+        }
+
+        /* allocate a new ompi_proc_t object for the process and insert it into the process table */
+        ret = ompi_proc_allocate (proc_name.jobid, proc_name.vpid, &proc);
+        if (OPAL_UNLIKELY(OMPI_SUCCESS != ret)) {
+            /* allocation fail */
+            break;
+        }
+
+        /* finish filling in the important proc data fields */
+        ret = ompi_proc_complete_init_single (proc);
+        if (OPAL_UNLIKELY(OMPI_SUCCESS != ret)) {
+            proc = NULL;
+            break;
+        }
+    } while (0);
+    OPAL_THREAD_UNLOCK(&ompi_proc_lock);
+
+    return (opal_proc_t *) proc;
+}
 
 int ompi_proc_init(void)
 {
-    ompi_vpid_t i;
-#if OPAL_ENABLE_HETEROGENEOUS_SUPPORT
+    int opal_proc_hash_init_size = (ompi_process_info.num_procs < ompi_add_procs_cutoff) ? ompi_process_info.num_procs :
+        1024;
+    ompi_proc_t *proc;
     int ret;
-#endif
 
     OBJ_CONSTRUCT(&ompi_proc_list, opal_list_t);
     OBJ_CONSTRUCT(&ompi_proc_lock, opal_mutex_t);
+    OBJ_CONSTRUCT(&ompi_proc_hash, opal_hash_table_t);
 
-    /* create proc structures and find self */
-    for( i = 0; i < ompi_process_info.num_procs; i++ ) {
-        ompi_proc_t *proc = OBJ_NEW(ompi_proc_t);
-        opal_list_append(&ompi_proc_list, (opal_list_item_t*)proc);
+    ret = opal_hash_table_init (&ompi_proc_hash, opal_proc_hash_init_size);
+    if (OPAL_SUCCESS != ret) {
+        return ret;
+    }
 
-        OMPI_CAST_RTE_NAME(&proc->super.proc_name)->jobid = OMPI_PROC_MY_NAME->jobid;
-        OMPI_CAST_RTE_NAME(&proc->super.proc_name)->vpid = i;
+    /* create a proc for the local process */
+    ret = ompi_proc_allocate (OMPI_PROC_MY_NAME->jobid, OMPI_PROC_MY_NAME->vpid, &proc);
+    if (OMPI_SUCCESS != ret) {
+        return OMPI_ERR_OUT_OF_RESOURCE;
+    }
 
-        if (i == OMPI_PROC_MY_NAME->vpid) {
-            ompi_proc_local_proc = proc;
-            proc->super.proc_flags = OPAL_PROC_ALL_LOCAL;
-            proc->super.proc_hostname = strdup(ompi_process_info.nodename);
-            proc->super.proc_arch = opal_local_arch;
-            /* Register the local proc with OPAL */
-            opal_proc_local_set(&proc->super);
+    /* set local process data */
+    ompi_proc_local_proc = proc;
+    proc->super.proc_flags = OPAL_PROC_ALL_LOCAL;
+    proc->super.proc_hostname = strdup(ompi_process_info.nodename);
+    proc->super.proc_arch = opal_local_arch;
+    /* Register the local proc with OPAL */
+    opal_proc_local_set(&proc->super);
 #if OPAL_ENABLE_HETEROGENEOUS_SUPPORT
-            /* add our arch to the modex */
-            OPAL_MODEX_SEND_VALUE(ret, PMIX_SYNC_REQD, PMIX_GLOBAL,
-                                  OPAL_DSTORE_ARCH, &opal_local_arch, OPAL_UINT32);
-            if (OPAL_SUCCESS != ret) {
+    /* add our arch to the modex */
+    OPAL_MODEX_SEND_VALUE(ret, PMIX_SYNC_REQD, PMIX_GLOBAL,
+                          OPAL_DSTORE_ARCH, &opal_local_arch, OPAL_UINT32);
+    if (OPAL_SUCCESS != ret) {
+        return ret;
+    }
+#endif
+
+    if (ompi_process_info.num_procs < ompi_add_procs_cutoff) {
+        /* create proc structures and find self */
+        for (ompi_vpid_t i = 0 ; i < ompi_process_info.num_procs ; ++i ) {
+            if (i == OMPI_PROC_MY_NAME->vpid) {
+                continue;
+            }
+
+            ret = ompi_proc_allocate (OMPI_PROC_MY_NAME->jobid, i, &proc);
+            if (OMPI_SUCCESS != i) {
                 return ret;
             }
-#endif
         }
     }
 
@@ -141,78 +311,14 @@ int ompi_proc_complete_init(void)
 {
     ompi_proc_t *proc;
     int ret, errcode = OMPI_SUCCESS;
-    opal_list_t myvals;
-    opal_value_t *kv;
 
     OPAL_THREAD_LOCK(&ompi_proc_lock);
 
     OPAL_LIST_FOREACH(proc, &ompi_proc_list, ompi_proc_t) {
-        if (OMPI_CAST_RTE_NAME(&proc->super.proc_name)->vpid != OMPI_PROC_MY_NAME->vpid) {
-            /* get the locality information - do not use modex recv for
-             * this request as that will automatically cause the hostname
-             * to be loaded as well. All RTEs are required to provide this
-             * information at startup for procs on our node. Thus, not
-             * finding the info indicates that the proc is non-local.
-             */
-            OBJ_CONSTRUCT(&myvals, opal_list_t);
-            if (OMPI_SUCCESS != (ret = opal_dstore.fetch(opal_dstore_internal,
-                                                         &proc->super.proc_name,
-                                                         OPAL_DSTORE_LOCALITY, &myvals))) {
-                proc->super.proc_flags = OPAL_PROC_NON_LOCAL;
-            } else {
-                kv = (opal_value_t*)opal_list_get_first(&myvals);
-                proc->super.proc_flags = kv->data.uint16;
-            }
-            OPAL_LIST_DESTRUCT(&myvals);
-
-            if (ompi_process_info.num_procs < ompi_direct_modex_cutoff) {
-                /* IF the number of procs falls below the specified cutoff,
-                 * then we assume the job is small enough that retrieving
-                 * the hostname (which will typically cause retrieval of
-                 * ALL modex info for this proc) will have no appreciable
-                 * impact on launch scaling
-                 */
-                OPAL_MODEX_RECV_VALUE(ret, OPAL_DSTORE_HOSTNAME, (opal_proc_t*)&proc->super,
-                                      (char**)&(proc->super.proc_hostname), OPAL_STRING);
-                if (OPAL_SUCCESS != ret) {
-                    errcode = ret;
-                    break;
-                }
-            } else {
-                /* just set the hostname to NULL for now - we'll fill it in
-                 * as modex_recv's are called for procs we will talk to, thus
-                 * avoiding retrieval of ALL modex info for this proc until
-                 * required. Transports that delay calling modex_recv until
-                 * first message will therefore scale better than those that
-                 * call modex_recv on all procs during init.
-                 */
-                proc->super.proc_hostname = NULL;
-            }
-#if OPAL_ENABLE_HETEROGENEOUS_SUPPORT
-            /* get the remote architecture - this might force a modex except
-             * for those environments where the RM provides it */
-            {
-                uint32_t *ui32ptr;
-                ui32ptr = &(proc->super.proc_arch);
-                OPAL_MODEX_RECV_VALUE(ret, OPAL_DSTORE_ARCH, (opal_proc_t*)&proc->super,
-                                      (void**)&ui32ptr, OPAL_UINT32);
-                if (OPAL_SUCCESS == ret) {
-                    /* if arch is different than mine, create a new convertor for this proc */
-                    if (proc->super.proc_arch != opal_local_arch) {
-                        OBJ_RELEASE(proc->super.proc_convertor);
-                        proc->super.proc_convertor = opal_convertor_create(proc->super.proc_arch, 0);
-                    }
-                } else if (OMPI_ERR_NOT_IMPLEMENTED == ret) {
-                    proc->super.proc_arch = opal_local_arch;
-                } else {
-                    errcode = ret;
-                    break;
-                }
-            }
-#else
-            /* must be same arch as my own */
-            proc->super.proc_arch = opal_local_arch;
-#endif
+        ret = ompi_proc_complete_init_single (proc);
+        if (OPAL_UNLIKELY(OMPI_SUCCESS != ret)) {
+            errcode = ret;
+            break;
         }
     }
     OPAL_THREAD_UNLOCK(&ompi_proc_lock);
@@ -251,6 +357,7 @@ int ompi_proc_finalize (void)
     /* now destruct the list and thread lock */
     OBJ_DESTRUCT(&ompi_proc_list);
     OBJ_DESTRUCT(&ompi_proc_lock);
+    OBJ_DESTRUCT(&ompi_proc_hash);
 
     return OMPI_SUCCESS;
 }
@@ -272,9 +379,7 @@ ompi_proc_t** ompi_proc_world(size_t *size)
 
     /* First count how many match this jobid */
     OPAL_THREAD_LOCK(&ompi_proc_lock);
-    for (proc =  (ompi_proc_t*)opal_list_get_first(&ompi_proc_list);
-         proc != (ompi_proc_t*)opal_list_get_end(&ompi_proc_list);
-         proc =  (ompi_proc_t*)opal_list_get_next(proc)) {
+    OPAL_LIST_FOREACH(proc, &ompi_proc_list, ompi_proc_t) {
         if (OPAL_EQUAL == ompi_rte_compare_name_fields(mask, OMPI_CAST_RTE_NAME(&proc->super.proc_name), &my_name)) {
             ++count;
         }
@@ -289,9 +394,7 @@ ompi_proc_t** ompi_proc_world(size_t *size)
 
     /* now save only the procs that match this jobid */
     count = 0;
-    for (proc =  (ompi_proc_t*)opal_list_get_first(&ompi_proc_list);
-         proc != (ompi_proc_t*)opal_list_get_end(&ompi_proc_list);
-         proc =  (ompi_proc_t*)opal_list_get_next(proc)) {
+    OPAL_LIST_FOREACH(proc, &ompi_proc_list, ompi_proc_t) {
         if (OPAL_EQUAL == ompi_rte_compare_name_fields(mask, &proc->super.proc_name, &my_name)) {
             /* DO NOT RETAIN THIS OBJECT - the reference count on this
              * object will be adjusted by external callers. The intent
@@ -329,9 +432,7 @@ ompi_proc_t** ompi_proc_all(size_t* size)
     }
 
     OPAL_THREAD_LOCK(&ompi_proc_lock);
-    for(proc =  (ompi_proc_t*)opal_list_get_first(&ompi_proc_list);
-        proc != (ompi_proc_t*)opal_list_get_end(&ompi_proc_list);
-        proc =  (ompi_proc_t*)opal_list_get_next(proc)) {
+    OPAL_LIST_FOREACH(proc, &ompi_proc_list, ompi_proc_t) {
         /* We know this isn't consistent with the behavior in ompi_proc_world,
          * but we are leaving the RETAIN for now because the code using this function
          * assumes that the results need to be released when done. It will
@@ -373,9 +474,7 @@ ompi_proc_t * ompi_proc_find ( const ompi_process_name_t * name )
     /* return the proc-struct which matches this jobid+process id */
     mask = OMPI_RTE_CMP_JOBID | OMPI_RTE_CMP_VPID;
     OPAL_THREAD_LOCK(&ompi_proc_lock);
-    for(proc =  (ompi_proc_t*)opal_list_get_first(&ompi_proc_list);
-        proc != (ompi_proc_t*)opal_list_get_end(&ompi_proc_list);
-        proc =  (ompi_proc_t*)opal_list_get_next(proc)) {
+    OPAL_LIST_FOREACH(proc, &ompi_proc_list, ompi_proc_t) {
         if (OPAL_EQUAL == ompi_rte_compare_name_fields(mask, &proc->super.proc_name, name)) {
             rproc = proc;
             break;
@@ -398,11 +497,7 @@ int ompi_proc_refresh(void)
 
     OPAL_THREAD_LOCK(&ompi_proc_lock);
 
-    for( item  = opal_list_get_first(&ompi_proc_list), i = 0;
-         item != opal_list_get_end(&ompi_proc_list);
-         item  = opal_list_get_next(item), ++i ) {
-        proc = (ompi_proc_t*)item;
-
+    OPAL_LIST_FOREACH(proc, &ompi_proc_list, ompi_proc_t) {
         /* Does not change: proc->super.proc_name.vpid */
         OMPI_CAST_RTE_NAME(&proc->super.proc_name)->jobid = OMPI_PROC_MY_NAME->jobid;
 
@@ -416,64 +511,10 @@ int ompi_proc_refresh(void)
             proc->super.proc_arch = opal_local_arch;
             opal_proc_local_set(&proc->super);
         } else {
-            /* get the locality information - do not use modex recv for
-             * this request as that will automatically cause the hostname
-             * to be loaded as well. All RTEs are required to provide this
-             * information at startup for procs on our node. Thus, not
-             * finding the info indicates that the proc is non-local.
-             */
-            OBJ_CONSTRUCT(&myvals, opal_list_t);
-            if (OMPI_SUCCESS != (ret = opal_dstore.fetch(opal_dstore_internal,
-                                                         &proc->super.proc_name,
-                                                         OPAL_DSTORE_LOCALITY, &myvals))) {
-                proc->super.proc_flags = OPAL_PROC_NON_LOCAL;
-            } else {
-                kv = (opal_value_t*)opal_list_get_first(&myvals);
-                proc->super.proc_flags = kv->data.uint16;
+            ret = ompi_proc_complete_init_single (proc);
+            if (OPAL_UNLIKELY(OMPI_SUCCESS != ret)) {
+                break;
             }
-            OPAL_LIST_DESTRUCT(&myvals);
-
-            if (ompi_process_info.num_procs < ompi_direct_modex_cutoff) {
-                /* IF the number of procs falls below the specified cutoff,
-                 * then we assume the job is small enough that retrieving
-                 * the hostname (which will typically cause retrieval of
-                 * ALL modex info for this proc) will have no appreciable
-                 * impact on launch scaling
-                 */
-                OPAL_MODEX_RECV_VALUE(ret, OPAL_DSTORE_HOSTNAME, (opal_proc_t*)&proc->super,
-                                      (char**)&(proc->super.proc_hostname), OPAL_STRING);
-                if (OMPI_SUCCESS != ret) {
-                    break;
-                }
-            } else {
-                /* just set the hostname to NULL for now - we'll fill it in
-                 * as modex_recv's are called for procs we will talk to, thus
-                 * avoiding retrieval of ALL modex info for this proc until
-                 * required. Transports that delay calling modex_recv until
-                 * first message will therefore scale better than those that
-                 * call modex_recv on all procs during init.
-                 */
-                proc->super.proc_hostname = NULL;
-            }
-#if OPAL_ENABLE_HETEROGENEOUS_SUPPORT
-            {
-                /* get the remote architecture */
-                uint32_t* uiptr = &(proc->super.proc_arch);
-                OPAL_MODEX_RECV_VALUE(ret, OPAL_DSTORE_ARCH, (opal_proc_t*)&proc->super,
-                                      (void**)&uiptr, OPAL_UINT32);
-                if (OMPI_SUCCESS != ret) {
-                    break;
-                }
-                /* if arch is different than mine, create a new convertor for this proc */
-                if (proc->super.proc_arch != opal_local_arch) {
-                    OBJ_RELEASE(proc->super.proc_convertor);
-                    proc->super.proc_convertor = opal_convertor_create(proc->super.proc_arch, 0);
-                }
-            }
-#else
-            /* must be same arch as my own */
-            proc->super.proc_arch = opal_local_arch;
-#endif
         }
     }
 
@@ -577,9 +618,7 @@ ompi_proc_find_and_add(const ompi_process_name_t * name, bool* isnew)
     /* return the proc-struct which matches this jobid+process id */
     mask = OMPI_RTE_CMP_JOBID | OMPI_RTE_CMP_VPID;
     OPAL_THREAD_LOCK(&ompi_proc_lock);
-    for(proc =  (ompi_proc_t*)opal_list_get_first(&ompi_proc_list);
-        proc != (ompi_proc_t*)opal_list_get_end(&ompi_proc_list);
-        proc =  (ompi_proc_t*)opal_list_get_next(proc)) {
+    OPAL_LIST_FOREACH(proc, &ompi_proc_list, ompi_proc_t) {
         if (OPAL_EQUAL == ompi_rte_compare_name_fields(mask, &proc->super.proc_name, name)) {
             rproc = proc;
             *isnew = false;

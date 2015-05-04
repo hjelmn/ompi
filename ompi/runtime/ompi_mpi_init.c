@@ -409,6 +409,7 @@ int ompi_mpi_init(int argc, char **argv, int requested, int *provided)
     /* Convince OPAL to use our naming scheme */
     opal_process_name_print = _process_name_print_for_opal;
     opal_compare_proc = _process_name_compare;
+    opal_proc_for_name = ompi_proc_for_name;
 
     /* Register MCA variables */
     if (OPAL_SUCCESS != (ret = ompi_register_mca_variables())) {
