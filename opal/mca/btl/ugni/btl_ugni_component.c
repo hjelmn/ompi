@@ -428,15 +428,17 @@ mca_btl_ugni_progress_datagram (mca_btl_ugni_module_t *ugni_module)
         proc_id = mca_btl_ugni_proc_name_to_id (ugni_module->wc_remote_attr.proc_name);
 
         BTL_VERBOSE(("received connection attempt on wildcard endpoint from proc id: %" PRIx64,
-                     ugni_module->wc_remote_attr.proc_id));
+                     proc_id));
 
         OPAL_THREAD_LOCK(&ugni_module->endpoint_lock);
-        rc = opal_hash_table_get_value_uint64 (&ugni_module->id_to_endpoint, proc_id, (void *) &ep);
+        rc = opal_hash_table_get_value_uint64 (&ugni_module->id_to_endpoint, proc_id, (void **) &ep);
         OPAL_THREAD_UNLOCK(&ugni_module->endpoint_lock);
 
         /* check if the endpoint is known */
         if (OPAL_UNLIKELY(OPAL_SUCCESS != rc || NULL == ep)) {
             struct opal_proc_t *remote_proc = opal_proc_for_name (ugni_module->wc_remote_attr.proc_name);
+            BTL_VERBOSE(("Got connection request from an unknown peer {jobid = 0x%x, vid = 0x%x}",
+                         ugni_module->wc_remote_attr.proc_name.jobid, ugni_module->wc_remote_attr.proc_name.vpid));
             ep = mca_btl_ugni_get_ep (&ugni_module->super, remote_proc);
             if (OPAL_UNLIKELY(NULL == ep)) {
                 return rc;

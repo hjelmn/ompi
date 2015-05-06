@@ -230,8 +230,8 @@ mca_btl_ugni_del_procs (struct mca_btl_base_module_t *btl,
                         struct opal_proc_t **procs,
                         struct mca_btl_base_endpoint_t **peers);
 
-bool mca_btl_ugni_reachable (struct mca_btl_base_module_t *module, opal_proc_t *proc, int flags);
-struct mca_btl_base_endpoint_t mca_btl_ugni_get_ep (struct mca_btl_base_module_t *module, opal_proc_t *proc);
+bool mca_btl_ugni_reachable (struct mca_btl_base_module_t *module, opal_proc_t *proc, int *flags);
+struct mca_btl_base_endpoint_t *mca_btl_ugni_get_ep (struct mca_btl_base_module_t *module, opal_proc_t *proc);
 
 /**
  * Initiate an asynchronous send.

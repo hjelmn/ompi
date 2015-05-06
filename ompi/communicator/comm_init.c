@@ -106,19 +106,15 @@ int ompi_comm_init(void)
     group->grp_proc_pointers = (ompi_proc_t **) calloc (size, sizeof (ompi_proc_t *));
     group->grp_proc_count = size;
 
-    fprintf (stderr, "World size: %u\n", size);
-
     for (size_t i = 0 ; i < size ; ++i) {
         opal_process_name_t name = {.vpid = i, .jobid = OMPI_PROC_MY_NAME->jobid};
-        group->grp_proc_pointers[i] = ompi_proc_lookup (name);
-        fprintf (stderr, "Proc pointer found for %u: 0x%08x\n", i, group->grp_proc_pointers[i]);
+        group->grp_proc_pointers[i] = (ompi_proc_t *) ompi_proc_lookup (name);
         if (NULL == group->grp_proc_pointers[i]) {
             /* set sentinel value */
             group->grp_proc_pointers[i] = (ompi_proc_t *)(-*((intptr_t *) &name));
         } else {
             OBJ_RETAIN (ompi_proc_local_proc);
         }
-        fprintf (stderr, "Proc pointer for %u: 0x%08x\n", i, group->grp_proc_pointers[i]);
     }
 
     OMPI_GROUP_SET_INTRINSIC (group);

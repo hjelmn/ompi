@@ -63,7 +63,7 @@ int mca_btl_ugni_add_procs (struct mca_btl_base_module_t* btl, size_t nprocs,
 
         /* check for an existing endpoint */
         OPAL_THREAD_LOCK(&ugni_module->endpoint_lock);
-        if (OPAL_SUCCESS != opal_hash_table_get_value_uint64 (&ugni_module->id_to_endpoint, proc_id, peers + i)) {
+        if (OPAL_SUCCESS != opal_hash_table_get_value_uint64 (&ugni_module->id_to_endpoint, proc_id, (void **) (peers + i))) {
             if (OPAL_PROC_ON_LOCAL_NODE(opal_proc->proc_flags)) {
                 ugni_module->nlocal_procs++;
 
@@ -231,7 +231,7 @@ int mca_btl_ugni_del_procs (struct mca_btl_base_module_t *btl,
     return OPAL_SUCCESS;
 }
 
-bool mca_btl_ugni_reachable (struct mca_btl_base_module_t *module, opal_proc_t *proc, int flags)
+bool mca_btl_ugni_reachable (struct mca_btl_base_module_t *module, opal_proc_t *proc, int *flags)
 {
 #pragma unused (proc, flags)
     /* all processes are reachable with gemini/aries */

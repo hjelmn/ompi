@@ -211,7 +211,6 @@ opal_proc_t *ompi_proc_lookup (const opal_process_name_t proc_name)
 
     /* try to lookup the value in the hash table */
     ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) &proc);
-    fprintf (stderr, "Looking up proc {%x, %x}: %p\n", proc_name.jobid, proc_name.vpid, proc);
 
     if (OPAL_SUCCESS == ret) {
         return &proc->super;
@@ -313,7 +312,7 @@ int ompi_proc_init(void)
     return OMPI_SUCCESS;
 }
 
-static ompi_proc_compare_vid (opal_list_item_t **a, opal_list_item_t **b)
+static int ompi_proc_compare_vid (opal_list_item_t **a, opal_list_item_t **b)
 {
     ompi_proc_t *proca = (ompi_proc_t *) *a;
     ompi_proc_t *procb = (ompi_proc_t *) *b;
@@ -368,9 +367,8 @@ int ompi_proc_complete_init(void)
 
             /* the runtime is required to fill in locality for all local processes by this
              * point. only local processes will have locality set */
-            ret = opal_dstore.fetch(opal_dstore_internal, &proc_name, OPAL_DSTORE_LOCALITY, NULL);
+            ret = opal_dstore.fetch(opal_dstore_internal, &proc_name, OPAL_DSTORE_LOCALITY, &myvals);
             if (OPAL_SUCCESS == ret) {
-                fprintf (stderr, "Locality of %d: 0x%hx\n", i, locality);
                 kv = (opal_value_t *) opal_list_remove_first (&myvals);
                 locality = kv->data.uint16;
                 OBJ_RELEASE(kv);
