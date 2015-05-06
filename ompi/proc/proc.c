@@ -109,7 +109,7 @@ static int ompi_proc_allocate (ompi_jobid_t jobid, ompi_vpid_t vpid, ompi_proc_t
     OMPI_CAST_RTE_NAME(&proc->super.proc_name)->vpid = vpid;
 
     opal_hash_table_set_value_ptr (&ompi_proc_hash, &proc->super.proc_name, sizeof (proc->super.proc_name),
-                                   ompi_proc_local_proc);
+                                   proc);
 
     *procp = proc;
 
@@ -204,13 +204,29 @@ static int ompi_proc_complete_init_single (ompi_proc_t *proc)
     return OMPI_SUCCESS;
 }
 
+opal_proc_t *ompi_proc_lookup (const opal_process_name_t proc_name)
+{
+    ompi_proc_t *proc = NULL;
+    int ret;
+
+    /* try to lookup the value in the hash table */
+    ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) &proc);
+    fprintf (stderr, "Looking up proc {%x, %x}: %p\n", proc_name.jobid, proc_name.vpid, proc);
+
+    if (OPAL_SUCCESS == ret) {
+        return &proc->super;
+    }
+
+    return NULL;
+}
+
 opal_proc_t *ompi_proc_for_name (const opal_process_name_t proc_name)
 {
     ompi_proc_t *proc = NULL;
     int ret;
 
     /* try to lookup the value in the hash table */
-    ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) proc);
+    ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) &proc);
     if (OPAL_SUCCESS == ret) {
         return &proc->super;
     }
@@ -218,7 +234,7 @@ opal_proc_t *ompi_proc_for_name (const opal_process_name_t proc_name)
     OPAL_THREAD_LOCK(&ompi_proc_lock);
     do {
         /* double-check that another competing thread has not added this proc */
-        ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) proc);
+        ret = opal_hash_table_get_value_ptr (&ompi_proc_hash, &proc_name, sizeof (proc_name), (void **) &proc);
         if (OPAL_SUCCESS == ret) {
             break;
         }
@@ -288,7 +304,7 @@ int ompi_proc_init(void)
             }
 
             ret = ompi_proc_allocate (OMPI_PROC_MY_NAME->jobid, i, &proc);
-            if (OMPI_SUCCESS != i) {
+            if (OMPI_SUCCESS != ret) {
                 return ret;
             }
         }
@@ -297,6 +313,19 @@ int ompi_proc_init(void)
     return OMPI_SUCCESS;
 }
 
+static ompi_proc_compare_vid (opal_list_item_t **a, opal_list_item_t **b)
+{
+    ompi_proc_t *proca = (ompi_proc_t *) *a;
+    ompi_proc_t *procb = (ompi_proc_t *) *b;
+
+    if (proca->super.proc_name.vpid > procb->super.proc_name.vpid) {
+        return 1;
+    } else {
+        return -1;
+    }
+
+    /* they should never be equal */
+}
 
 /**
  * The process creation is split into two steps. The second step
@@ -322,6 +351,40 @@ int ompi_proc_complete_init(void)
         }
     }
     OPAL_THREAD_UNLOCK(&ompi_proc_lock);
+
+    if (ompi_process_info.num_procs >= ompi_add_procs_cutoff) {
+        opal_list_t myvals;
+        opal_value_t *kv;
+
+        /* find and add all local processes */
+        OBJ_CONSTRUCT(&myvals, opal_list_t);
+        for (ompi_vpid_t i = 0 ; i < ompi_process_info.num_procs ; ++i ) {
+            opal_process_name_t proc_name = {.vpid = i, .jobid = OMPI_PROC_MY_NAME->jobid};
+            uint16_t locality = OPAL_PROC_NON_LOCAL;
+
+            if (OMPI_PROC_MY_NAME->vpid == i) {
+                continue;
+            }
+
+            /* the runtime is required to fill in locality for all local processes by this
+             * point. only local processes will have locality set */
+            ret = opal_dstore.fetch(opal_dstore_internal, &proc_name, OPAL_DSTORE_LOCALITY, NULL);
+            if (OPAL_SUCCESS == ret) {
+                fprintf (stderr, "Locality of %d: 0x%hx\n", i, locality);
+                kv = (opal_value_t *) opal_list_remove_first (&myvals);
+                locality = kv->data.uint16;
+                OBJ_RELEASE(kv);
+            }
+
+            if (OPAL_PROC_NON_LOCAL != locality) {
+                (void) ompi_proc_for_name (proc_name);
+            }
+        }
+        OPAL_LIST_DESTRUCT(&myvals);
+    }
+
+    opal_list_sort (&ompi_proc_list, ompi_proc_compare_vid);
+
     return errcode;
 }
 

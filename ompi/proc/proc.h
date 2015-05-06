@@ -319,6 +319,8 @@ OMPI_DECLSPEC int ompi_proc_refresh(void);
 OMPI_DECLSPEC opal_proc_t *ompi_proc_for_name (const opal_process_name_t proc_name);
 
 
+OMPI_DECLSPEC opal_proc_t *ompi_proc_lookup (const opal_process_name_t proc_name);
+
 END_C_DECLS
 
 #endif /* OMPI_PROC_PROC_H */
