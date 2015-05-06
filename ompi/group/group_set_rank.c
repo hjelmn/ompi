@@ -38,9 +38,17 @@ void ompi_set_group_rank(ompi_group_t *group, struct ompi_proc_t *proc_pointer)
         for (proc = 0; proc < group->grp_proc_count; proc++) {
             /* check and see if this proc pointer matches proc_pointer
              */
+#if OMPI_GROUP_SPARSE
             if (ompi_group_peer_lookup(group,proc) == proc_pointer) {
+                fprintf (stderr, "my rank: %d\n", proc);
                 group->grp_my_rank = proc;
             }
+#else
+            if (group->grp_proc_pointers[proc] == proc_pointer) {
+                fprintf (stderr, "my rank: %d\n", proc);
+                group->grp_my_rank = proc;
+            }
+#endif
         }                       /* end proc loop */
     }
 

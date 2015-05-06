@@ -14,7 +14,7 @@
  * Copyright (c) 2007-2012 Cisco Systems, Inc.  All rights reserved.
  * Copyright (c) 2009      Sun Microsystems, Inc. All rights reserved.
  * Copyright (c) 2012      Oak Ridge National Labs.  All rights reserved.
- * Copyright (c) 2013      Los Alamos National Security, LLC.  All rights
+ * Copyright (c) 2013-2015 Los Alamos National Security, LLC.  All rights
  *                         reserved.
  * $COPYRIGHT$
  * 
@@ -339,9 +339,18 @@ static inline struct ompi_proc_t* ompi_group_peer_lookup(ompi_group_t *group, in
 #if OMPI_GROUP_SPARSE
     return ompi_group_get_proc_ptr (group, peer_id);
 #else
+    if (OPAL_UNLIKELY((intptr_t) group->grp_proc_pointers[peer_id] < 0)) {
+        intptr_t sentinel = -(intptr_t) group->grp_proc_pointers[peer_id];
+        opal_output (0, "Getting ompi_proc_t for process 0x%llx on group %p\n", (unsigned long long) sentinel, (void *) group);
+        /* replace sentinel value with an actual ompi_proc_t */
+        group->grp_proc_pointers[peer_id] =
+            (ompi_proc_t *) ompi_proc_for_name (*((opal_process_name_t *) &sentinel));
+    }
     return group->grp_proc_pointers[peer_id];
 #endif
 }
+
+bool ompi_group_have_remote_peers (ompi_group_t *group);
 
 /**
  *  Function to print the group info
