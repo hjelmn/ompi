@@ -109,7 +109,7 @@ int mca_pml_ob1_enable(bool enable)
                           mca_pml_ob1.free_list_max,
                           mca_pml_ob1.free_list_inc,
                           NULL, 0, NULL, NULL, NULL);
-                                                                                                            
+
     OBJ_CONSTRUCT(&mca_pml_ob1.recv_frags, opal_free_list_t);
 
     opal_free_list_init ( &mca_pml_ob1.recv_frags,
@@ -121,7 +121,7 @@ int mca_pml_ob1_enable(bool enable)
                           mca_pml_ob1.free_list_max,
                           mca_pml_ob1.free_list_inc,
                           NULL, 0, NULL, NULL, NULL);
-                                                                                                            
+
     OBJ_CONSTRUCT(&mca_pml_ob1.pending_pckts, opal_free_list_t);
     opal_free_list_init ( &mca_pml_ob1.pending_pckts,
                           sizeof(mca_pml_ob1_pckt_pending_t),
@@ -302,7 +302,7 @@ int mca_pml_ob1_add_procs(ompi_proc_t** procs, size_t nprocs)
 
     /*
      * JJH: Disable this in FT enabled builds since
-     * we use a wrapper PML. It will cause this check to 
+     * we use a wrapper PML. It will cause this check to
      * return failure as all processes will return the wrapper PML
      * component in use instead of the wrapped PML component underneath.
      */
@@ -335,7 +335,7 @@ int mca_pml_ob1_add_procs(ompi_proc_t** procs, size_t nprocs)
     OPAL_LIST_FOREACH(sm, &mca_btl_base_modules_initialized, mca_btl_base_selected_module_t) {
         if (sm->btl_module->btl_eager_limit < sizeof(mca_pml_ob1_hdr_t)) {
             opal_show_help("help-mpi-pml-ob1.txt", "eager_limit_too_small",
-                           true, 
+                           true,
                            sm->btl_component->btl_version.mca_component_name,
                            ompi_process_info.nodename,
                            sm->btl_component->btl_version.mca_component_name,
@@ -357,7 +357,7 @@ int mca_pml_ob1_add_procs(ompi_proc_t** procs, size_t nprocs)
         if (0 != sm->btl_module->btl_cuda_eager_limit) {
             if (sm->btl_module->btl_cuda_eager_limit < sizeof(mca_pml_ob1_hdr_t)) {
                 opal_show_help("help-mpi-pml-ob1.txt", "cuda_eager_limit_too_small",
-                               true, 
+                               true,
                                sm->btl_component->btl_version.mca_component_name,
                                ompi_process_info.nodename,
                                sm->btl_component->btl_version.mca_component_name,
@@ -375,7 +375,7 @@ int mca_pml_ob1_add_procs(ompi_proc_t** procs, size_t nprocs)
         } else {
             if (sm->btl_module->btl_cuda_rdma_limit < sm->btl_module->btl_cuda_eager_limit) {
                 opal_show_help("help-mpi-pml-ob1.txt", "cuda_rdma_limit_too_small",
-                               true, 
+                               true,
                                sm->btl_component->btl_version.mca_component_name,
                                ompi_process_info.nodename,
                                sm->btl_component->btl_version.mca_component_name,
@@ -397,7 +397,7 @@ int mca_pml_ob1_add_procs(ompi_proc_t** procs, size_t nprocs)
                                NULL );
     if(OMPI_SUCCESS != rc)
         goto cleanup_and_return;
-    
+
     rc = mca_bml.bml_register( MCA_PML_OB1_HDR_TYPE_RNDV,
                                mca_pml_ob1_recv_frag_callback_rndv,
                                NULL );
@@ -409,19 +409,19 @@ int mca_pml_ob1_add_procs(ompi_proc_t** procs, size_t nprocs)
                                NULL );
     if(OMPI_SUCCESS != rc)
         goto cleanup_and_return;
-    
+
     rc = mca_bml.bml_register( MCA_PML_OB1_HDR_TYPE_ACK,
                                mca_pml_ob1_recv_frag_callback_ack,
                                NULL );
     if(OMPI_SUCCESS != rc)
         goto cleanup_and_return;
-    
+
     rc = mca_bml.bml_register( MCA_PML_OB1_HDR_TYPE_FRAG,
                                mca_pml_ob1_recv_frag_callback_frag,
                                NULL );
     if(OMPI_SUCCESS != rc)
         goto cleanup_and_return;
-    
+
     rc = mca_bml.bml_register( MCA_PML_OB1_HDR_TYPE_PUT,
                                mca_pml_ob1_recv_frag_callback_put,
                                NULL );
@@ -433,12 +433,12 @@ int mca_pml_ob1_add_procs(ompi_proc_t** procs, size_t nprocs)
                                NULL );
     if(OMPI_SUCCESS != rc)
         goto cleanup_and_return;
-    
+
     /* register error handlers */
     rc = mca_bml.bml_register_error(mca_pml_ob1_error_handler);
     if(OMPI_SUCCESS != rc)
         goto cleanup_and_return;
-    
+
   cleanup_and_return:
     OBJ_DESTRUCT(&reachable);
 
@@ -539,7 +539,7 @@ static void mca_pml_ob1_dump_frag_list(opal_list_t* queue, bool is_req)
             else snprintf(ctag, 64, "%d", req->req_tag);
 
             opal_output(0, "req %p peer %s tag %s addr %p count %lu datatype %s [%p] [%s %s] req_seq %" PRIu64,
-                        (void*) req, cpeer, ctag, 
+                        (void*) req, cpeer, ctag,
                         (void*) req->req_addr, req->req_count,
                         (0 != req->req_count ? req->req_datatype->name : "N/A"),
                         (void*) req->req_datatype,
@@ -580,7 +580,7 @@ int mca_pml_ob1_dump(struct ompi_communicator_t* comm, int verbose)
         size_t n;
 
         opal_output(0, "[Rank %d] expected_seq %d ompi_proc %p send_seq %d\n",
-                    i, proc->expected_sequence, (void*) proc->ompi_proc, 
+                    i, proc->expected_sequence, (void*) proc->ompi_proc,
                     proc->send_sequence);
 
         /* dump all receive queues */
@@ -610,8 +610,8 @@ static void mca_pml_ob1_fin_completion( mca_btl_base_module_t* btl,
                                         struct mca_btl_base_descriptor_t* des,
                                         int status )
 {
-    
-    mca_bml_base_btl_t* bml_btl = (mca_bml_base_btl_t*) des->des_context; 
+
+    mca_bml_base_btl_t* bml_btl = (mca_bml_base_btl_t*) des->des_context;
 
     /* check for pending requests */
     MCA_PML_OB1_PROGRESS_PENDING(bml_btl);
@@ -675,11 +675,11 @@ void mca_pml_ob1_process_pending_packets(mca_bml_base_btl_t* bml_btl)
         OPAL_THREAD_UNLOCK(&mca_pml_ob1.lock);
         if(NULL == pckt)
             break;
-        if(pckt->bml_btl != NULL && 
+        if(pckt->bml_btl != NULL &&
                 pckt->bml_btl->btl == bml_btl->btl) {
             send_dst = pckt->bml_btl;
         } else {
-            mca_bml_base_endpoint_t* endpoint = 
+            mca_bml_base_endpoint_t* endpoint =
                 (mca_bml_base_endpoint_t*) pckt->proc->proc_endpoints[OMPI_PROC_ENDPOINT_TAG_BML];
             send_dst = mca_bml_base_btl_array_find(
                     &endpoint->btl_eager, bml_btl->btl);
@@ -757,7 +757,7 @@ void mca_pml_ob1_process_pending_rdma(void)
 
 void mca_pml_ob1_error_handler(
         struct mca_btl_base_module_t* btl, int32_t flags,
-        opal_proc_t* errproc, char* btlinfo ) { 
+        opal_proc_t* errproc, char* btlinfo ) {
 #if OPAL_CUDA_SUPPORT
     if (flags & MCA_BTL_ERROR_FLAGS_ADD_CUDA_IPC) {
         mca_pml_ob1_cuda_add_ipc_support(btl, flags, (struct ompi_proc_t*)errproc, btlinfo);
@@ -790,7 +790,7 @@ int mca_pml_ob1_ft_event( int state )
     else if(OPAL_CRS_CONTINUE == state) {
         first_continue_pass = !first_continue_pass;
 
-        if( !first_continue_pass ) { 
+        if( !first_continue_pass ) {
             if( opal_cr_timing_barrier_enabled ) {
                 OPAL_CR_SET_TIMER(OPAL_CR_TIMER_COREBR0);
                 opal_pmix.fence(NULL, 0);
@@ -811,7 +811,7 @@ int mca_pml_ob1_ft_event( int state )
              * Refresh the proc structure, and publish our proc info in the modex.
              * NOTE: Do *not* call ompi_proc_finalize as there are many places in
              *       the code that point to indv. procs in this strucutre. For our
-             *       needs here we only need to fix up the modex, bml and pml 
+             *       needs here we only need to fix up the modex, bml and pml
              *       references.
              */
             if (OMPI_SUCCESS != (ret = ompi_proc_refresh())) {
@@ -850,7 +850,7 @@ int mca_pml_ob1_ft_event( int state )
          * Refresh the proc structure, and publish our proc info in the modex.
          * NOTE: Do *not* call ompi_proc_finalize as there are many places in
          *       the code that point to indv. procs in this strucutre. For our
-         *       needs here we only need to fix up the modex, bml and pml 
+         *       needs here we only need to fix up the modex, bml and pml
          *       references.
          */
         if (OMPI_SUCCESS != (ret = ompi_proc_refresh())) {
@@ -880,7 +880,7 @@ int mca_pml_ob1_ft_event( int state )
         opal_output(0, "pml:base: ft_event: BML ft_event function failed: %d\n",
                     ret);
     }
-    
+
     if(OPAL_CRS_CHECKPOINT == state) {
         OPAL_CR_SET_TIMER(OPAL_CR_TIMER_P2P1);
 
