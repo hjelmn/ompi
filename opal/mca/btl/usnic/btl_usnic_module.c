@@ -105,6 +105,28 @@ static int add_procs_create_endpoints(opal_btl_usnic_module_t *module,
             continue;
         }
 
+        /* See if we have an endpoint for this (module, proc) tuple
+           already (e.g., if we have received something from this peer
+           already) */
+        bool found = false;
+        opal_list_item_t *ep_li;
+        opal_btl_usnic_endpoint_t *ep;
+        opal_mutex_lock(&module->all_endpoints_lock);
+        OPAL_LIST_FOREACH(ep_li, &module->all_endpoints,
+                          opal_list_item_t) {
+            ep = container_of(ep_li, opal_btl_usnic_endpoint_t, endpoint_endpoint_li);
+            if (opal_compare_proc(ep->endpoint_proc->proc_opal->proc_name,
+                                  opal_proc->proc_name) == 0) {
+                endpoints[i] = ep;
+                found = true;
+                break;
+            }
+        }
+        opal_mutex_unlock(&module->all_endpoints_lock);
+        if (found) {
+            continue;
+        }
+
         /* Find (or create if it doesn't exist) this peer's proc.
            This will receive the modex info for that proc.  Note that
            the proc is shared by all usnic modules that are trying
@@ -212,7 +234,7 @@ add_procs_reap_fi_av_inserts(opal_btl_usnic_module_t *module,
     num_left = 0;
     for (i = 0; i < array_len; ++i) {
         if (NULL != endpoints[i]) {
-            num_left += USNIC_NUM_CHANNELS;
+            num_left += endpoints[i]->num_fiavins_to_reap;
         }
     }
 
@@ -371,6 +393,8 @@ add_procs_reap_fi_av_inserts(opal_btl_usnic_module_t *module,
                 OBJ_RELEASE(endpoints[i]);
                 endpoints[i] = NULL;
             }
+
+            endpoints[i]->num_fiavins_to_reap = 0;
         }
     }
 

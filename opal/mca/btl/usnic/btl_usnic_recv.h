@@ -78,8 +78,9 @@ lookup_sender(opal_btl_usnic_module_t *module, opal_btl_usnic_segment_t *seg)
         return sender;
     }
 
-    /* The sender wasn't in the hash table, so do a slow lookup and
-       put the result in the hash table */
+    /* The sender wasn't in the hash table, so do a slow lookup of all
+       peer endpoints that we currently know about and put the result
+       in the hash table */
     sender = opal_btl_usnic_proc_lookup_endpoint(module,
                                                  seg->us_btl_header->sender);
     if (NULL != sender) {
@@ -88,7 +89,33 @@ lookup_sender(opal_btl_usnic_module_t *module, opal_btl_usnic_segment_t *seg)
         return sender;
     }
 
-    /* Whoa -- not found at all! */
+#if BTL_VERSION >= 30
+    /* This can only happen in BTL >v3.0 */
+
+    /* If we don't know about that peer endpoint yet, ensure that it's
+       an MPI process peer that is known in this universe.
+       opal_proc_for_name() will try to modex for this name; if that
+       name is in the universe, we'll get an (opal_proc_t*) back.
+       Otherwise, we'll get a NULL if it's unknown (e.g., if someone
+       hits our incoming usNIC UDP port with a random packet, like a
+       port scanner or something). */
+    opal_process_name_t pname;
+    usnic_compat_rte_unhash_name(seg->us_btl_header->sender, &pname);
+    opal_proc_t *proc = opal_proc_for_name(pname);
+    if (OPAL_LIKELY(NULL != proc)) {
+        struct mca_btl_base_endpoint_t *endpoint;
+        if (OPAL_SUCCESS != module->super.btl_add_procs(&module->super,
+                                                        1, &proc,
+                                                        &endpoint, NULL)) {
+            return NULL;
+        }
+
+        assert(endpoint);
+        return endpoint;
+    }
+#endif
+
+    /* We have no idea who this process is.  Kaboom. */
     return NULL;
 }
 
@@ -331,8 +358,9 @@ drop:
         channel->chan_deferred_recv = seg;
     }
 
-    /* Otherwise, handle all the other cases the "normal" way */
-    else {
+    /* Otherwise, as long as we identified the sender as an MPI
+       process peer, handle all the other cases the "normal" way */
+    else if (OPAL_LIKELY(NULL != endpoint)) {
         opal_btl_usnic_recv_call(module, seg, channel);
     }
 }
@@ -414,7 +442,7 @@ opal_btl_usnic_recv(opal_btl_usnic_module_t *module,
                 bseg->us_btl_header->payload_type) &&
             seg->rs_base.us_btl_header->put_addr == NULL) {
 
-        MSGDEBUG1_OUT("<-- Received FRAG (fastpath) ep %p, seq %" UDSEQ ", len=%" PRIu16 "\n",
+        MSGDEBUG1_OUT("<-- Received FRAG ep %p, seq %" UDSEQ ", len=%" PRIu16 "\n",
                       (void*) endpoint, bseg->us_btl_header->pkt_seq,
                       bseg->us_btl_header->payload_len);
 
@@ -437,8 +465,9 @@ opal_btl_usnic_recv(opal_btl_usnic_module_t *module,
 
     }
 
-    /* Otherwise, handle all the other cases the "normal" way */
-    else {
+    /* Otherwise, as long as we identified the sender as an MPI
+       process peer, handle all the other cases the "normal" way */
+    else if (OPAL_LIKELY(NULL != endpoint)) {
         opal_btl_usnic_recv_call(module, seg, channel);
     }
 }

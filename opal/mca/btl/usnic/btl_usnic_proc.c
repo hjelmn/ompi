@@ -743,13 +743,14 @@ opal_btl_usnic_create_endpoint(opal_btl_usnic_module_t *module,
     endpoint->endpoint_remote_modex = proc->proc_modex[modex_index];
 
     /* Start creating destinations; one for each channel.  These
-       progress in the background.a */
+       progress in the background. */
     for (int i = 0; i < USNIC_NUM_CHANNELS; ++i)  {
         rc = start_av_insert(module, endpoint, i);
         if (OPAL_SUCCESS != rc) {
             OBJ_RELEASE(endpoint);
             return rc;
         }
+        ++endpoint->num_fiavins_to_reap;
     }
 
     /* Initialize endpoint sequence number info */

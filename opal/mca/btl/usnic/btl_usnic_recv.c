@@ -337,8 +337,12 @@ void opal_btl_usnic_recv_call(opal_btl_usnic_module_t *module,
         ++module->stats.num_ack_recvs;
 
 #if MSGDEBUG1
-        opal_output(0, "    Received ACK for sequence number %" UDSEQ " from %s to %s\n",
-                    bseg->us_btl_header->ack_seq, remote_ip, local_ip);
+        opal_output(0, "    Received ACK for sequence number %" UDSEQ " from %s:%u to %s:%u, module %p endpoint %p\n",
+                    bseg->us_btl_header->ack_seq,
+                    remote_ip, endpoint->endpoint_remote_modex.ports[0],
+                    local_ip, module->local_modex.ports[0],
+                    (void*) module,
+                    (void*) endpoint);
 #endif
         opal_btl_usnic_handle_ack(endpoint, ack_seq);
 

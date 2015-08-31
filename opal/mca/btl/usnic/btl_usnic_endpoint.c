@@ -13,7 +13,7 @@
  *                         reserved.
  * Copyright (c) 2007      The Regents of the University of California.
  *                         All rights reserved.
- * Copyright (c) 2013-2014 Cisco Systems, Inc.  All rights reserved.
+ * Copyright (c) 2013-2015 Cisco Systems, Inc.  All rights reserved.
  * Copyright (c) 2015      Intel, Inc. All rights reserved
  * $COPYRIGHT$
  *
@@ -55,6 +55,7 @@ static void endpoint_construct(mca_btl_base_endpoint_t* endpoint)
     endpoint->endpoint_exiting = false;
     endpoint->endpoint_connectivity_checked = false;
     endpoint->endpoint_on_all_endpoints = false;
+    endpoint->num_fiavins_to_reap = 0;
 
     for (i = 0; i < USNIC_NUM_CHANNELS; ++i) {
         endpoint->endpoint_remote_modex.ports[i] = 0;

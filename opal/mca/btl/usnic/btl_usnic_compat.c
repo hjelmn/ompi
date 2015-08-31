@@ -64,6 +64,16 @@ uint64_t usnic_compat_rte_hash_name(opal_process_name_t *pname)
     return name;
 }
 
+/* This is techinically not a "compat" function -- it does not exist
+   in <v2.0.  It is here solely as a counterpart to the
+   usnic_compat_rte_hash_name(), above. */
+void usnic_compat_rte_unhash_name(uint64_t hashed_name,
+                                  opal_process_name_t *pname)
+{
+    pname->jobid = (hashed_name >> 32);
+    pname->vpid = (hashed_name & 0xffffffff);
+}
+
 const char *usnic_compat_proc_name_print(opal_process_name_t *pname)
 {
     return OPAL_NAME_PRINT(*pname);

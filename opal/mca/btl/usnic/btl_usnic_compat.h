@@ -325,6 +325,10 @@ opal_btl_usnic_put(
 
 #include "opal/mca/btl/btl.h"
 
+void usnic_compat_rte_unhash_name(uint64_t hashed_name,
+                                  opal_process_name_t *pname);
+
+
 /* This function changed signature compared to BTL 2.0 */
 struct mca_btl_base_descriptor_t *
 opal_btl_usnic_prepare_src(struct mca_btl_base_module_t *base_module,
