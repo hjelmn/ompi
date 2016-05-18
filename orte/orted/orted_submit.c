@@ -114,7 +114,6 @@ static char **global_mca_env = NULL;
 static orte_std_cntr_t total_num_apps = 0;
 static bool want_prefix_by_default = (bool) ORTE_WANT_ORTERUN_PREFIX_BY_DEFAULT;
 static opal_pointer_array_t tool_jobs;
-static bool mycmdline = false;
 int orte_debugger_attach_fd = -1;
 bool orte_debugger_fifo_active=false;
 opal_event_t *orte_debugger_attach=NULL;
@@ -253,10 +252,9 @@ int orte_submit_init(int argc, char *argv[],
     }
 
     if (OPAL_SUCCESS != (rc = mca_base_cmd_line_process_args(orte_cmd_line, &environ, &environ))) {
-	return rc;
+        return rc;
     }
 
-    OBJ_RELEASE(orte_cmd_line);
 
     /* init only the util portion of OPAL */
     if (OPAL_SUCCESS != (rc = opal_init_util(&argc, &argv))) {
@@ -275,24 +273,16 @@ int orte_submit_init(int argc, char *argv[],
     OBJ_CONSTRUCT(&tool_jobs, opal_pointer_array_t);
     opal_pointer_array_init(&tool_jobs, 256, INT_MAX, 128);
 
-    /* setup the cmd line only once */
+    /* if they were provided, add the opts */
     if (NULL != opts) {
-        /* just add the component-defined ones to the end */
-        if (OPAL_SUCCESS != (rc = orte_schizo.define_cli(opts))) {
+        if (OPAL_SUCCESS != (rc = opal_cmd_line_add(orte_cmd_line, opts))) {
             return rc;
         }
-        orte_cmd_line = opts;
-        mycmdline = false;
-    } else {
+    }
 
-        /* have to create the cmd line next as even --help
-         * will need it */
-        orte_cmd_line = OBJ_NEW(opal_cmd_line_t);
-        if (OPAL_SUCCESS != (rc = orte_schizo.define_cli(orte_cmd_line))) {
-            OBJ_RELEASE(orte_cmd_line);
-            return rc;
-        }
-        mycmdline = true;
+    /* setup the rest of the cmd line only once */
+    if (OPAL_SUCCESS != (rc = orte_schizo.define_cli(orte_cmd_line))) {
+        return rc;
     }
 
     /* now that options have been defined, finish setup */
@@ -595,7 +585,7 @@ void orte_submit_finalize(void)
     OBJ_DESTRUCT(&tool_jobs);
 
     /* destruct the cmd line object */
-    if (mycmdline) {
+    if (NULL != orte_cmd_line) {
         OBJ_RELEASE(orte_cmd_line);
     }
 
