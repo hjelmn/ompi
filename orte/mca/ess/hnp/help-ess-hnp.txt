@@ -1,0 +1,26 @@
+# -*- text -*-
+#
+# Copyright (c) 2017      Los Alamos National Security, LLC. All rights
+#                         reserved.
+# $COPYRIGHT$
+#
+# Additional copyrights may follow
+#
+# $HEADER$
+#
+[invalid_signal]
+An invalid value was specified in the ess_hnp_forward_signals MCA
+variable. The value is expected to be a comma-delimited list of
+unique integer values not inclusing SIGUSR1 or SIGUSR2. Both SIGUSR1
+and SIGUSR2 are always forwarded by mpirun.
+
+ Invalid signal: %s
+#
+[duplicate_signal]
+An duplicate value was specified in the ess_hnp_forward_signals MCA
+variable. The value is expected to be a comma-delimited list of
+unique integer values not inclusing SIGUSR1 or SIGUSR2. Both SIGUSR1
+and SIGUSR2 are always forwarded by mpirun.
+
+ Duplicate signal: %s
+#
