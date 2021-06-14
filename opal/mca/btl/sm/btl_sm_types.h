@@ -162,7 +162,8 @@ struct mca_btl_sm_component_t {
 
     int single_copy_mechanism; /**< single copy mechanism to use */
 
-    int memcpy_limit;             /**< Limit where we switch from memmove to memcpy */
+    size_t memcpy_limit;          /**< Limit where we switch from memmove to memcpy */
+    size_t memcpy_chunk_size;     /**< Maximum size of a memcpy chunk. */
     int log_attach_align;         /**< Log of the alignment for xpmem segments */
     unsigned int max_inline_send; /**< Limit for copy-in-copy-out fragments */
 

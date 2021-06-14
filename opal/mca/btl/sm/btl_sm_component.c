@@ -137,15 +137,25 @@ static int mca_btl_sm_component_register(void)
                                            MCA_BASE_VAR_SCOPE_LOCAL,
                                            &mca_btl_sm_component.sm_free_list_inc);
 
-    mca_btl_sm_component.memcpy_limit = 524288;
+    mca_btl_sm_component.memcpy_limit = 262144;
     (void) mca_base_component_var_register(&mca_btl_sm_component.super.btl_version, "memcpy_limit",
                                            "Message size to switch from using "
                                            "memove to memcpy. The relative speed of these two "
                                            "routines can vary by size.",
-                                           MCA_BASE_VAR_TYPE_INT, NULL, 0,
+                                           MCA_BASE_VAR_TYPE_SIZE_T, NULL, 0,
                                            MCA_BASE_VAR_FLAG_SETTABLE, OPAL_INFO_LVL_5,
                                            MCA_BASE_VAR_SCOPE_LOCAL,
                                            &mca_btl_sm_component.memcpy_limit);
+
+    mca_btl_sm_component.memcpy_chunk_size = 262144;
+    (void) mca_base_component_var_register(&mca_btl_sm_component.super.btl_version, "memcpy_chunk_size",
+                                           "Maximum size to copy in a single memcpy/memmove operation. "
+                                           "Decreasing the chunk size may improve performance on some "
+                                           "platforms.",
+                                           MCA_BASE_VAR_TYPE_SIZE_T, NULL, 0,
+                                           MCA_BASE_VAR_FLAG_SETTABLE, OPAL_INFO_LVL_5,
+                                           MCA_BASE_VAR_SCOPE_LOCAL,
+                                           &mca_btl_sm_component.memcpy_chunk_size);
 #if OPAL_BTL_SM_HAVE_XPMEM
     mca_btl_sm_component.log_attach_align = 21;
     (void) mca_base_component_var_register(&mca_btl_sm_component.super.btl_version, "log_align",

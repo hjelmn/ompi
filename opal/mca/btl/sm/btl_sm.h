@@ -87,10 +87,18 @@ OPAL_MODULE_DECLSPEC extern mca_btl_sm_t mca_btl_sm;
    pointers are aliased (TODO -- readd alias check) */
 static inline void sm_memmove(void *dst, void *src, size_t size)
 {
-    if (size >= (size_t) mca_btl_sm_component.memcpy_limit) {
-        memcpy(dst, src, size);
-    } else {
-        memmove(dst, src, size);
+    const size_t chunk_size = mca_btl_sm_component.memcpy_chunk_size;
+
+    while (size > 0) {
+        size_t copy_size = size > chunk_size ? chunk_size : size;
+        if (copy_size >= (size_t) mca_btl_sm_component.memcpy_limit) {
+            memcpy (dst, src, copy_size);
+        } else {
+            memmove (dst, src, copy_size);
+        }
+        size -= copy_size;
+        dst = (char *) dst + copy_size;
+        src = (char *) src + copy_size;
     }
 }
 
