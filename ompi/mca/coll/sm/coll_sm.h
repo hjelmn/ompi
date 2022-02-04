@@ -1,3 +1,4 @@
+/* -*- Mode: C; c-basic-offset:4 ; indent-tabs-mode:nil -*- */
 /*
  * Copyright (c) 2004-2007 The Trustees of Indiana University and Indiana
  *                         University Research and Technology
@@ -12,6 +13,7 @@
  * Copyright (c) 2008-2009 Cisco Systems, Inc.  All rights reserved.
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
+ * Copyright (c) 2021-2022 Google, LLC. ALl rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -28,24 +30,24 @@
 #include "mpi.h"
 #include "ompi/mca/mca.h"
 #include "opal/datatype/opal_convertor.h"
-#include "opal/mca/common/sm/common_sm.h"
+#include "opal/mca/shmem/shmem.h"
+#include "opal/mca/shmem/base/base.h"
 #include "ompi/mca/coll/coll.h"
 
 BEGIN_C_DECLS
 
 /* Attempt to give some sort of progress / fairness if we're blocked
    in an sm collective for a long time: call opal_progress once in a
-   great while.  Use a "goto" label for expdiency to exit loops. */
+   great while. */
 #define SPIN_CONDITION_MAX 100000
-#define SPIN_CONDITION(cond, exit_label) \
-  do { \
-       if (cond) goto exit_label; \
-       for (int spin_cond_i = 0; spin_cond_i < SPIN_CONDITION_MAX; ++spin_cond_i) { \
-           if (cond) { goto exit_label; } \
-       } \
-       opal_progress(); \
-  } while (1); \
-  exit_label:
+static inline __opal_attribute_always_inline__ void mca_coll_sm_spin_until_equal(volatile uint32_t *location, uint32_t value) {
+  do {
+    for (int spin_cond_i = SPIN_CONDITION_MAX ; spin_cond_i > 0; --spin_cond_i) {
+           if (*location == value) return;
+    }
+    opal_progress();
+  } while (1);
+}
 
     /**
      * Structure to hold the sm coll component.  First it holds the
@@ -88,6 +90,9 @@ BEGIN_C_DECLS
             the division once and then just use the value without
             having to re-calculate. */
         int sm_segs_per_inuse_flag;
+
+        /** Directory to use when creating shared memory backing files. */
+        char *sm_backing_directory;
     } mca_coll_sm_component_t;
 
     /**
@@ -104,6 +109,12 @@ BEGIN_C_DECLS
             mcstn_num_children */
         struct mca_coll_sm_tree_node_t **mcstn_children;
     } mca_coll_sm_tree_node_t;
+
+    typedef struct mca_coll_sm_tree_t {
+      int node_count;
+      int my_tree_rank;
+      mca_coll_sm_tree_node_t nodes[];
+    } mca_coll_sm_tree_t;
 
     /**
      * Simple structure comprising the "in use" flags.  Contains two
@@ -141,25 +152,10 @@ BEGIN_C_DECLS
      * comm's sm collective operations area.
      */
     typedef struct mca_coll_sm_comm_t {
-        /* Meta data that we get back from the common mmap allocation
-           function */
-        mca_common_sm_module_t *sm_bootstrap_meta;
+      /** Shared memory segment for this communicator */
+        opal_shmem_ds_t sm_segment;
 
-        /** Pointer to my barrier control pages (odd index pages are
-            "in", even index pages are "out") */
-        uint32_t *mcb_barrier_control_me;
-
-        /** Pointer to my parent's barrier control pages (will be NULL
-            for communicator rank 0; odd index pages are "in", even
-            index pages are "out") */
-        opal_atomic_uint32_t *mcb_barrier_control_parent;
-
-        /** Pointers to my childrens' barrier control pages (they're
-            contiguous in memory, so we only point to the base -- the
-            number of children is in my entry in the mcb_tree); will
-            be NULL if this process has no children (odd index pages
-            are "in", even index pages are "out") */
-        uint32_t *mcb_barrier_control_children;
+      uint8_t *sm_segment_base;
 
         /** Number of barriers that we have executed (i.e., which set
             of barrier buffers to use). */
@@ -168,17 +164,19 @@ BEGIN_C_DECLS
         /** "In use" flags indicating which segments are available */
         mca_coll_sm_in_use_flag_t *mcb_in_use_flags;
 
-        /** Array of indexes into the per-communicator shmem data
-            segment for control and data fragment passing (containing
-            pointers to each segments control and data areas). */
-        mca_coll_sm_data_index_t *mcb_data_index;
+      /** Tree containing all processes on this process's NUMA node */
+      mca_coll_sm_tree_t *mcb_intra_numa_tree;
 
-        /** Array of graph nodes representing the tree used for
-            communications */
-        mca_coll_sm_tree_node_t *mcb_tree;
+      /** Tree containing the local leaders for all NUMA domains. This is NULL if only one NUMA domain is in use on this communicator. */
+      mca_coll_sm_tree_t *mcb_inter_numa_tree;
 
         /** Operation number (i.e., which segment number to use) */
         uint32_t mcb_operation_count;
+
+        /** Array of indexes into the per-communicator shmem data
+            segment for control and data fragment passing (containing
+            pointers to each segments control and data areas). */
+      mca_coll_sm_data_index_t mcb_data_index[];
     } mca_coll_sm_comm_t;
 
     /** Coll sm module */
@@ -316,12 +314,22 @@ BEGIN_C_DECLS
 				   struct ompi_communicator_t *comm,
 				   mca_coll_base_module_t *module);
 
-/**
- * Global variables used in the macros (essentially constants, so
- * these are thread safe)
- */
-extern uint32_t mca_coll_sm_one;
+enum {
+  MCA_COLL_SM_BARRIER_DIRECTION_IN = 0,
+  MCA_COLL_SM_BARRIER_DIRECTION_OUT = 1,
+};
 
+/* Barrier control buffers are placed on different cache lines. The line size here is picked to be the largest common size (128B-- Apple Mx, IBM Power, etc). */
+static inline uint32_t *mca_coll_sm_barrier_control(mca_coll_sm_comm_t *sm_comm_data, int rank, int direction, int buffer_set, int bindex)
+{
+  const size_t cache_line_size = 128;
+  return (uint32_t *)(sm_comm_data->sm_segment_base + rank * mca_coll_sm_component.sm_control_size + (2 * buffer_set + direction) * cache_line_size) + bindex;
+}
+
+static inline size_t mca_coll_sm_barrier_buffer_size(void)
+{
+  return mca_coll_sm_component.sm_control_size;
+}
 
 /**
  * Macro to setup flag usage
@@ -335,7 +343,7 @@ extern uint32_t mca_coll_sm_one;
  * Macro to wait for the in-use flag to become idle (used by the root)
  */
 #define FLAG_WAIT_FOR_IDLE(flag, label) \
-    SPIN_CONDITION(0 == (flag)->mcsiuf_num_procs_using, label)
+  mca_coll_sm_spin_until_equal(&(flag)->mcsiuf_num_procs_using, 0)
 
 /**
  * Macro to wait for a flag to indicate that it's ready for this
@@ -343,20 +351,22 @@ extern uint32_t mca_coll_sm_one;
  * been called)
  */
 #define FLAG_WAIT_FOR_OP(flag, op, label) \
-    SPIN_CONDITION((op) == flag->mcsiuf_operation_count, label)
+  mca_coll_sm_spin_until_equal(&(flag)->mcsiuf_operation_count, op)
 
 /**
  * Macro to set an in-use flag with relevant data to claim it
  */
-#define FLAG_RETAIN(flag, num_procs, op_count) \
+#define FLAG_RETAIN(flag, num_procs, op_count)	  \
+  do {						  \
     (flag)->mcsiuf_num_procs_using = (num_procs); \
-    (flag)->mcsiuf_operation_count = (op_count)
+    (flag)->mcsiuf_operation_count = (op_count);  \
+  } while (0)
 
 /**
  * Macro to release an in-use flag from this process
  */
 #define FLAG_RELEASE(flag) \
-    opal_atomic_add(&(flag)->mcsiuf_num_procs_using, -1)
+    opal_atomic_fetch_add_32(&(flag)->mcsiuf_num_procs_using, -1)
 
 /**
  * Macro to copy a single segment in from a user buffer to a shared
@@ -367,7 +377,7 @@ extern uint32_t mca_coll_sm_one;
         (index)->mcbmi_data + \
         ((rank) * mca_coll_sm_component.sm_fragment_size); \
     (iov).iov_len = (max_data); \
-    opal_convertor_pack(&(convertor), &(iov), &mca_coll_sm_one, \
+    opal_convertor_pack(&(convertor), &(iov), &(uint32_t){1}, \
                         &(max_data) )
 
 /**
@@ -378,7 +388,7 @@ extern uint32_t mca_coll_sm_one;
     (iov).iov_base = (((char*) (index)->mcbmi_data) + \
                        ((src_rank) * (mca_coll_sm_component.sm_fragment_size))); \
     (iov).iov_len = (max_data); \
-    opal_convertor_unpack(&(convertor), &(iov), &mca_coll_sm_one, \
+    opal_convertor_unpack(&(convertor), &(iov), &(uint32_t){1}, \
                           &(max_data) )
 
 /**

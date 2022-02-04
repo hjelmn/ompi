@@ -1,3 +1,4 @@
+/* -*- Mode: C; c-basic-offset:4 ; indent-tabs-mode:nil -*- */
 /*
  * Copyright (c) 2004-2005 The Trustees of Indiana University and Indiana
  *                         University Research and Technology
@@ -10,6 +11,7 @@
  * Copyright (c) 2004-2005 The Regents of the University of California.
  *                         All rights reserved.
  * Copyright (c) 2015 Cisco Systems, Inc.  All rights reserved.
+ * Copyright (c) 2021-2022 Google, LLC. All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -50,44 +52,51 @@
  * parent, and the leaves that have no children.  But that's the
  * general idea.
  */
-int mca_coll_sm_barrier_intra(struct ompi_communicator_t *comm,
-                              mca_coll_base_module_t *module)
+static void mca_coll_sm_barrier_intra_twoproc(struct ompi_communicator_t *comm,
+					      mca_coll_sm_module_t *sm_module,
+					      mca_coll_sm_comm_t *data,
+					      int buffer_set, int bindex,
+					      const mca_coll_sm_tree_t *tree)
 {
-    int rank, buffer_set;
-    mca_coll_sm_comm_t *data;
-    uint32_t i, num_children;
-    volatile uint32_t *me_in, *me_out, *children = NULL;
-    opal_atomic_uint32_t *parent;
-    int uint_control_size;
-    mca_coll_sm_module_t *sm_module = (mca_coll_sm_module_t*) module;
+    uint32_t *in = mca_coll_sm_barrier_control(data, ompi_comm_rank(comm), 0, buffer_set, bindex);
+    int other_rank = (tree->my_tree_rank == 0) ? 1 : 0;
+    uint32_t *out = mca_coll_sm_barrier_control(data, tree->nodes[other_rank].mcstn_id, 0, buffer_set, bindex);
 
-    /* Lazily enable the module the first time we invoke a collective
-       on it */
-    if (!sm_module->enabled) {
-        int ret;
-        if (OMPI_SUCCESS != (ret = ompi_coll_sm_lazy_enable(module, comm))) {
-            return ret;
-        }
-    }
+    *out = 1;
+    mca_coll_sm_spin_until_equal(in, 1);
+    *in = 0;
+}
 
-    uint_control_size =
-        mca_coll_sm_component.sm_control_size / sizeof(uint32_t);
-    data = sm_module->sm_comm_data;
-    rank = ompi_comm_rank(comm);
-    num_children = data->mcb_tree[rank].mcstn_num_children;
-    buffer_set = ((data->mcb_barrier_count++) % 2) * 2;
-    me_in = &data->mcb_barrier_control_me[buffer_set];
-    me_out = (uint32_t*)
-        (((char*) me_in) + mca_coll_sm_component.sm_control_size);
+static void mca_coll_sm_barrier_intra_flat(struct ompi_communicator_t *comm,
+					   mca_coll_sm_module_t *sm_module,
+					   mca_coll_sm_comm_t *data,
+					   int buffer_set, int bindex,
+					   const mca_coll_sm_tree_t *tree)
+{
+  for (int i = 0 ; i < tree->node_count ; ++i) {
+    opal_atomic_int32_t *value = (opal_atomic_int32_t *) mca_coll_sm_barrier_control(data, tree->nodes[i].mcstn_id, 0, buffer_set, bindex);
+    opal_atomic_fetch_add_32(value, 1);
+  }
+  opal_atomic_int32_t *out = (opal_atomic_int32_t *) mca_coll_sm_barrier_control(data, tree->nodes[tree->my_tree_rank].mcstn_id, 0, buffer_set, bindex);
+  mca_coll_sm_spin_until_equal((uint32_t *) out, tree->node_count);
+  *out = 0;
+}
+
+static inline void mca_coll_sm_barrier_intra_tree_gather_phase(struct ompi_communicator_t *comm,
+							       mca_coll_sm_module_t *sm_module,
+							       mca_coll_sm_comm_t *data,
+							       int buffer_set, int bindex,
+							       const mca_coll_sm_tree_t *tree)
+{
+    const mca_coll_sm_tree_node_t *my_tree_node = tree->nodes + tree->my_tree_rank;
+    int num_children = my_tree_node->mcstn_num_children;
+    volatile uint32_t *in = mca_coll_sm_barrier_control(data, my_tree_node->mcstn_id, MCA_COLL_SM_BARRIER_DIRECTION_IN, buffer_set, bindex);
+    volatile uint32_t *parent_in = my_tree_node->mcstn_parent ? mca_coll_sm_barrier_control(data, my_tree_node->mcstn_parent->mcstn_id, MCA_COLL_SM_BARRIER_DIRECTION_IN, buffer_set, bindex) : NULL;
 
     /* Wait for my children to write to my *in* buffer */
-
     if (0 != num_children) {
-        /* Get children *out* buffer */
-        children = data->mcb_barrier_control_children + buffer_set +
-            uint_control_size;
-        SPIN_CONDITION(*me_in == num_children, exit_label1);
-        *me_in = 0;
+	mca_coll_sm_spin_until_equal(in, num_children);
+	*in = 0;
     }
 
     /* Send to my parent and wait for a response (don't poll on
@@ -99,26 +108,86 @@ int mca_coll_sm_barrier_intra(struct ompi_communicator_t *comm,
        process, and it is only changed *once* by an external
        process) */
 
-    if (0 != rank) {
-        /* Get parent *in* buffer */
-        parent = &data->mcb_barrier_control_parent[buffer_set];
-        opal_atomic_add (parent, 1);
+    if (NULL != parent_in) {
+	/* Signal to the parent that this process has arrived using its in buffer. */
+	opal_atomic_fetch_add_32 ((opal_atomic_int32_t *)parent_in, 1);
+    }
+}
 
-        SPIN_CONDITION(0 != *me_out, exit_label2);
-        *me_out = 0;
+static inline void mca_coll_sm_barrier_intra_tree_bcast_phase(struct ompi_communicator_t *comm,
+							      mca_coll_sm_module_t *sm_module,
+							      mca_coll_sm_comm_t *data,
+							      int buffer_set, int bindex,
+							      const mca_coll_sm_tree_t *tree)
+{
+    int rank = ompi_comm_rank(comm);
+    const mca_coll_sm_tree_node_t *my_tree_node = tree->nodes + tree->my_tree_rank;
+    int num_children = my_tree_node->mcstn_num_children;
+    volatile uint32_t *out = mca_coll_sm_barrier_control(data, rank, MCA_COLL_SM_BARRIER_DIRECTION_OUT, buffer_set, bindex);
+
+    if (0 != rank) {
+	mca_coll_sm_spin_until_equal(out, 1);
+        *out = 0;
     }
 
     /* Send to my children */
-
-    for (i = 0; i < num_children; ++i) {
-        children[i * uint_control_size * 4] = 1;
+    for (int i = 0; i < num_children; ++i) {
+      uint32_t *child_out = mca_coll_sm_barrier_control(data, my_tree_node->mcstn_children[i]->mcstn_id, MCA_COLL_SM_BARRIER_DIRECTION_OUT, buffer_set, bindex);
+      *child_out = 1;
     }
 
-    /* All done!  End state of the control segment:
+    /* All done!  End state of the control segment should be zeroed */
+}
 
-       me_in: 0
-       me_out: 0
-    */
+static void mca_coll_sm_barrier_intra_tree(struct ompi_communicator_t *comm,
+					   mca_coll_sm_module_t *sm_module,
+					   mca_coll_sm_comm_t *data,
+					   int buffer_set, int bindex,
+					   const mca_coll_sm_tree_t *tree)
+{
+    int rank = ompi_comm_rank(comm);
+    volatile uint32_t *me_in, *me_out;
+    const mca_coll_sm_tree_node_t *my_tree_node = tree->nodes + tree->my_tree_rank;
+    int num_children = my_tree_node->mcstn_num_children;
+
+    if (-1 == tree->my_tree_rank) {
+	return;
+    }
+
+    if (2 == tree->node_count) {
+      mca_coll_sm_barrier_intra_twoproc(comm, sm_module, data, buffer_set, bindex, tree);
+      return;
+    }
+
+    mca_coll_sm_barrier_intra_tree_gather_phase(comm, sm_module, data, buffer_set, bindex, tree);
+    mca_coll_sm_barrier_intra_tree_bcast_phase(comm, sm_module, data, buffer_set, bindex, tree);
+}
+
+int mca_coll_sm_barrier_intra(struct ompi_communicator_t *comm,
+                              mca_coll_base_module_t *module)
+{
+    mca_coll_sm_module_t *sm_module = (mca_coll_sm_module_t*) module;
+
+    /* Lazily enable the module the first time we invoke a collective
+       on it */
+    if (!sm_module->enabled) {
+        int ret;
+        if (OMPI_SUCCESS != (ret = ompi_coll_sm_lazy_enable(module, comm))) {
+            return ret;
+        }
+    }
+
+    mca_coll_sm_comm_t *data = sm_module->sm_comm_data;
+    int buffer_set = (data->mcb_barrier_count++) & 1;
+
+    if (NULL == data->mcb_inter_numa_tree) {
+	mca_coll_sm_barrier_intra_tree (comm, sm_module, data, buffer_set, /*bindex=*/0, data->mcb_intra_numa_tree);
+	return OMPI_SUCCESS;
+    }
+
+    mca_coll_sm_barrier_intra_tree_gather_phase(comm, sm_module, data, buffer_set, /*bindex=*/0, data->mcb_inter_numa_tree);
+    mca_coll_sm_barrier_intra_tree(comm, sm_module, data, buffer_set, /*bindex=*/1, data->mcb_inter_numa_tree);
+    mca_coll_sm_barrier_intra_tree_bcast_phase(comm, sm_module, data, buffer_set, /*bindex=*/0, data->mcb_inter_numa_tree);
 
     return OMPI_SUCCESS;
 }

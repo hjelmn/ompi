@@ -1,3 +1,4 @@
+/* -*- Mode: C; c-basic-offset:4 ; indent-tabs-mode:nil -*- */
 /*
  * Copyright (c) 2004-2007 The Trustees of Indiana University and Indiana
  *                         University Research and Technology
@@ -17,6 +18,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2015-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2018      Amazon.com, Inc. or its affiliates.  All Rights reserved.
+ * Copyright (c) 2021-2022 Google, LLC. All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -52,24 +54,20 @@
 #include "opal_stdint.h"
 #include "opal/mca/hwloc/base/base.h"
 #include "opal/util/os_path.h"
+#include "opal/util/minmax.h"
 #include "opal/util/printf.h"
 
+#include "ompi/runtime/ompi_rte.h"
 #include "ompi/communicator/communicator.h"
 #include "ompi/group/group.h"
 #include "ompi/mca/coll/coll.h"
 #include "ompi/mca/coll/base/base.h"
-#include "ompi/runtime/ompi_rte.h"
+#include "ompi/mca/coll/base/coll_base_functions.h"
 #include "ompi/proc/proc.h"
 #include "coll_sm.h"
 
 #include "ompi/mca/coll/base/coll_tags.h"
 #include "ompi/mca/pml/pml.h"
-
-/*
- * Global variables
- */
-uint32_t mca_coll_sm_one = 1;
-
 
 /*
  * Local functions
@@ -80,6 +78,9 @@ static int bootstrap_comm(ompi_communicator_t *comm,
                           mca_coll_sm_module_t *module);
 static int mca_coll_sm_module_disable(mca_coll_base_module_t *module,
                           struct ompi_communicator_t *comm);
+static int mca_coll_sm_generate_numa_trees(mca_coll_sm_module_t *sm_module, ompi_communicator_t *comm, int degree);
+static void mca_coll_sm_print_tree(const mca_coll_sm_tree_t *tree);
+
 
 /*
  * Module constructor
@@ -102,12 +103,10 @@ static void mca_coll_sm_module_destruct(mca_coll_sm_module_t *module)
 
     if (NULL != c) {
         /* Munmap the per-communicator shmem data segment */
-        if (NULL != c->sm_bootstrap_meta) {
-            /* Ignore any errors -- what are we going to do about
-               them? */
-            mca_common_sm_fini(c->sm_bootstrap_meta);
-            OBJ_RELEASE(c->sm_bootstrap_meta);
+        if (NULL != c->sm_segment_base) {
+            opal_shmem_segment_detach(&c->sm_segment);
         }
+
         free(c);
     }
 
@@ -183,7 +182,7 @@ mca_coll_sm_comm_query(struct ompi_communicator_t *comm, int *priority)
     /* Get the priority level attached to this module. If priority is less
      * than or equal to 0, then the module is unavailable. */
     *priority = mca_coll_sm_component.sm_priority;
-    if (mca_coll_sm_component.sm_priority < 0) {
+    if (mca_coll_sm_component.sm_priority <= 0) {
         opal_output_verbose(10, ompi_coll_base_framework.framework_output,
                             "coll:sm:comm_query (%s/%s): priority too low; disqualifying myself",
 			    ompi_comm_print_cid (comm), comm->c_name);
@@ -199,20 +198,27 @@ mca_coll_sm_comm_query(struct ompi_communicator_t *comm, int *priority)
     sm_module->super.coll_module_enable = sm_module_enable;
     sm_module->super.coll_allgather  = NULL;
     sm_module->super.coll_allgatherv = NULL;
-    sm_module->super.coll_allreduce  = mca_coll_sm_allreduce_intra;
+    sm_module->super.coll_allreduce  = NULL;
     sm_module->super.coll_alltoall   = NULL;
     sm_module->super.coll_alltoallv  = NULL;
     sm_module->super.coll_alltoallw  = NULL;
     sm_module->super.coll_barrier    = mca_coll_sm_barrier_intra;
-    sm_module->super.coll_bcast      = mca_coll_sm_bcast_intra;
+    sm_module->super.coll_bcast      = NULL;
     sm_module->super.coll_exscan     = NULL;
     sm_module->super.coll_gather     = NULL;
     sm_module->super.coll_gatherv    = NULL;
-    sm_module->super.coll_reduce     = mca_coll_sm_reduce_intra;
+    sm_module->super.coll_reduce     = NULL;
     sm_module->super.coll_reduce_scatter = NULL;
     sm_module->super.coll_scan       = NULL;
     sm_module->super.coll_scatter    = NULL;
     sm_module->super.coll_scatterv   = NULL;
+
+#if 0
+    /* Save previous component's reduce information */
+    sm_module->previous_reduce = comm->c_coll->coll_reduce;
+    sm_module->previous_reduce_module = comm->c_coll->coll_reduce_module;
+    OBJ_RETAIN(comm->c_coll->coll_reduce_module);
+#endif
 
     opal_output_verbose(10, ompi_coll_base_framework.framework_output,
                         "coll:sm:comm_query (%s/%s): pick me! pick me!",
@@ -239,38 +245,98 @@ static int sm_module_enable(mca_coll_base_module_t *module,
     return OMPI_SUCCESS;
 }
 
-int ompi_coll_sm_lazy_enable(mca_coll_base_module_t *module,
-                             struct ompi_communicator_t *comm)
+static int ompi_coll_sm_setup_maffinity(mca_coll_sm_module_t *sm_module, ompi_communicator_t *comm, unsigned char *base)
 {
-    int i, j, root, ret;
-    int rank = ompi_comm_rank(comm);
+    mca_coll_sm_comm_t *data = sm_module->sm_comm_data;
+    mca_coll_sm_component_t *component = &mca_coll_sm_component;
+    int rank = ompi_comm_rank (comm);
     int size = ompi_comm_size(comm);
-    mca_coll_sm_module_t *sm_module = (mca_coll_sm_module_t*) module;
-    mca_coll_sm_comm_t *data = NULL;
-    size_t control_size, frag_size;
-    mca_coll_sm_component_t *c = &mca_coll_sm_component;
-    opal_hwloc_base_memory_segment_t *maffinity;
-    int parent, min_child, num_children;
-    unsigned char *base = NULL;
-    const int num_barrier_buffers = 2;
-
-    /* Just make sure we haven't been here already */
-    if (sm_module->enabled) {
-        return OMPI_SUCCESS;
-    }
-    sm_module->enabled = true;
-
-    /* Get some space to setup memory affinity (just easier to try to
+ 
+   /* Get some space to setup memory affinity (just easier to try to
        alloc here to handle the error case) */
-    maffinity = (opal_hwloc_base_memory_segment_t*)
+    opal_hwloc_base_memory_segment_t *maffinity = (opal_hwloc_base_memory_segment_t*)
         malloc(sizeof(opal_hwloc_base_memory_segment_t) *
-               c->sm_comm_num_segments * 3);
+               component->sm_comm_num_segments * 3);
     if (NULL == maffinity) {
         opal_output_verbose(10, ompi_coll_base_framework.framework_output,
                             "coll:sm:enable (%s/%s): malloc failed (1)",
                             ompi_comm_print_cid (comm), comm->c_name);
         return OMPI_ERR_OUT_OF_RESOURCE;
     }
+
+    /* All things being equal, if we're rank 0, then make the in-use
+       flags be local (memory affinity).  Then zero them all out so
+       that they're marked as unused. */
+    int j = 0;
+    if (0 == rank) {
+        maffinity[j].mbs_start_addr = base;
+        maffinity[j].mbs_len = component->sm_control_size *
+            component->sm_comm_num_in_use_flags;
+        /* Set the op counts to 1 (actually any nonzero value will do)
+           so that the first time children/leaf processes come
+           through, they don't see a value of 0 and think that the
+           root/parent has already set the count to their op number
+           (i.e., 0 is the first op count value). */
+        for (int i = 0; i < mca_coll_sm_component.sm_comm_num_in_use_flags; ++i) {
+            ((mca_coll_sm_in_use_flag_t *)base)[i].mcsiuf_operation_count = 1;
+            ((mca_coll_sm_in_use_flag_t *)base)[i].mcsiuf_num_procs_using = 0;
+        }
+        ++j;
+    }
+
+    /* Next, setup pointers to the control and data portions of the
+       segments, as well as to the relevant in-use flags. */
+    base += (component->sm_comm_num_in_use_flags * component->sm_control_size);
+    size_t control_size = size * component->sm_control_size;
+    size_t frag_size = size * component->sm_fragment_size;
+    for (int i = 0; i < component->sm_comm_num_segments; ++i) {
+        data->mcb_data_index[i].mcbmi_control = (uint32_t*)
+            (base + (i * (control_size + frag_size)));
+        data->mcb_data_index[i].mcbmi_data =
+            (((char*) data->mcb_data_index[i].mcbmi_control) +
+             control_size);
+
+        /* Memory affinity: control */
+        maffinity[j].mbs_len = component->sm_control_size;
+        maffinity[j].mbs_start_addr = (void *)
+            (((char*) data->mcb_data_index[i].mcbmi_control) +
+             (rank * component->sm_control_size));
+        ++j;
+
+        /* Memory affinity: data */
+        maffinity[j].mbs_len = component->sm_fragment_size;
+        maffinity[j].mbs_start_addr =
+            ((char*) data->mcb_data_index[i].mcbmi_data) +
+            (rank * component->sm_control_size);
+        ++j;
+    }
+
+    /* Setup memory affinity so that the pages that belong to this
+       process are local to this process */
+    opal_hwloc_base_memory_set(maffinity, j);
+    free(maffinity);
+
+        return OMPI_SUCCESS;
+}
+
+int ompi_coll_sm_lazy_enable(mca_coll_base_module_t *module,
+                             struct ompi_communicator_t *comm)
+{
+    int root, ret;
+    int rank = ompi_comm_rank(comm);
+    int size = ompi_comm_size(comm);
+    mca_coll_sm_module_t *sm_module = (mca_coll_sm_module_t*) module;
+    mca_coll_sm_comm_t *data = NULL;
+    size_t frag_size;
+    mca_coll_sm_component_t *component = &mca_coll_sm_component;
+    int parent, min_child, num_children;
+    unsigned char *base = NULL;
+
+    /* Just make sure we haven't been here already */
+    if (sm_module->enabled) {
+        return OMPI_SUCCESS;
+    }
+    sm_module->enabled = true;
 
     /* Allocate data to hang off the communicator.  The memory we
        alloc will be laid out as follows:
@@ -285,79 +351,21 @@ int ompi_coll_sm_lazy_enable(mca_coll_base_module_t *module,
           mca_coll_sm_tree_node_t
     */
     sm_module->sm_comm_data = data = (mca_coll_sm_comm_t*)
-        malloc(sizeof(mca_coll_sm_comm_t) +
-               (c->sm_comm_num_segments *
-                sizeof(mca_coll_sm_data_index_t)) +
-               (size *
-                (sizeof(mca_coll_sm_tree_node_t) +
-                 (sizeof(mca_coll_sm_tree_node_t*) * c->sm_tree_degree))));
+        calloc(1, sizeof(mca_coll_sm_comm_t) +
+               (component->sm_comm_num_segments *
+                sizeof(mca_coll_sm_data_index_t)));
     if (NULL == data) {
-        free(maffinity);
         opal_output_verbose(10, ompi_coll_base_framework.framework_output,
                             "coll:sm:enable (%s/%s): malloc failed (2)",
                             ompi_comm_print_cid (comm), comm->c_name);
         return OMPI_ERR_TEMP_OUT_OF_RESOURCE;
     }
-    data->mcb_operation_count = 0;
 
-    /* Setup #2: set the array to point immediately beyond the
-       mca_coll_base_comm_t */
-    data->mcb_data_index = (mca_coll_sm_data_index_t*) (data + 1);
-    /* Setup array of pointers for #3 */
-    data->mcb_tree = (mca_coll_sm_tree_node_t*)
-        (data->mcb_data_index + c->sm_comm_num_segments);
-    /* Finally, setup the array of children pointers in the instances
-       in #5 to point to their corresponding arrays in #6 */
-    data->mcb_tree[0].mcstn_children = (mca_coll_sm_tree_node_t**)
-        (data->mcb_tree + size);
-    for (i = 1; i < size; ++i) {
-        data->mcb_tree[i].mcstn_children =
-            data->mcb_tree[i - 1].mcstn_children + c->sm_tree_degree;
-    }
-
-    /* Pre-compute a tree for a given number of processes and degree.
-       We'll re-use this tree for all possible values of root (i.e.,
-       shift everyone's process to be the "0"/root in this tree. */
-    for (root = 0; root < size; ++root) {
-        parent = (root - 1) / mca_coll_sm_component.sm_tree_degree;
-        num_children = mca_coll_sm_component.sm_tree_degree;
-
-        /* Do we have children?  If so, how many? */
-
-        if ((root * num_children) + 1 >= size) {
-            /* Leaves */
-            min_child = -1;
-            num_children = 0;
-        } else {
-            /* Interior nodes */
-            int max_child;
-            min_child = root * num_children + 1;
-            max_child = root * num_children + num_children;
-            if (max_child >= size) {
-                max_child = size - 1;
-            }
-            num_children = max_child - min_child + 1;
-        }
-
-        /* Save the values */
-        data->mcb_tree[root].mcstn_id = root;
-        if (root == 0 && parent == 0) {
-            data->mcb_tree[root].mcstn_parent = NULL;
-        } else {
-            data->mcb_tree[root].mcstn_parent = &data->mcb_tree[parent];
-        }
-        data->mcb_tree[root].mcstn_num_children = num_children;
-        for (i = 0; i < c->sm_tree_degree; ++i) {
-            data->mcb_tree[root].mcstn_children[i] =
-                (i < num_children) ?
-                &data->mcb_tree[min_child + i] : NULL;
-        }
-    }
+    mca_coll_sm_generate_numa_trees(sm_module, comm, component->sm_tree_degree);
 
     /* Attach to this communicator's shmem data segment */
     if (OMPI_SUCCESS != (ret = bootstrap_comm(comm, sm_module))) {
         free(data);
-        free(maffinity);
         sm_module->sm_comm_data = NULL;
         return ret;
     }
@@ -370,173 +378,69 @@ int ompi_coll_sm_lazy_enable(mca_coll_base_module_t *module,
        parents, and [the beginning of] my children (note that the
        children are contiguous, so having the first pointer and the
        num_children from the mcb_tree data is sufficient). */
-    control_size = c->sm_control_size;
-    base = data->sm_bootstrap_meta->module_data_addr;
-    data->mcb_barrier_control_me = (uint32_t*)
-        (base + (rank * control_size * num_barrier_buffers * 2));
-    if (data->mcb_tree[rank].mcstn_parent) {
-        data->mcb_barrier_control_parent = (opal_atomic_uint32_t*)
-            (base +
-             (data->mcb_tree[rank].mcstn_parent->mcstn_id * control_size *
-              num_barrier_buffers * 2));
-    } else {
-        data->mcb_barrier_control_parent = NULL;
-    }
-    if (data->mcb_tree[rank].mcstn_num_children > 0) {
-        data->mcb_barrier_control_children = (uint32_t*)
-            (base +
-             (data->mcb_tree[rank].mcstn_children[0]->mcstn_id * control_size *
-              num_barrier_buffers * 2));
-    } else {
-        data->mcb_barrier_control_children = NULL;
-    }
-    data->mcb_barrier_count = 0;
+    base = data->sm_segment_base;
+
+    opal_output_verbose(10, ompi_coll_base_framework.framework_output,
+                        "coll:sm:enable (%s/%s): base=%p",  ompi_comm_print_cid (comm), comm->c_name, base);
 
     /* Next, setup the pointer to the in-use flags.  The number of
        segments will be an even multiple of the number of in-use
        flags. */
-    base += (c->sm_control_size * size * num_barrier_buffers * 2);
-    data->mcb_in_use_flags = (mca_coll_sm_in_use_flag_t*) base;
+    base += (size * mca_coll_sm_barrier_buffer_size());
+    data->mcb_in_use_flags = (mca_coll_sm_in_use_flag_t *) base;
 
-    /* All things being equal, if we're rank 0, then make the in-use
-       flags be local (memory affinity).  Then zero them all out so
-       that they're marked as unused. */
-    j = 0;
-    if (0 == rank) {
-        maffinity[j].mbs_start_addr = base;
-        maffinity[j].mbs_len = c->sm_control_size *
-            c->sm_comm_num_in_use_flags;
-        /* Set the op counts to 1 (actually any nonzero value will do)
-           so that the first time children/leaf processes come
-           through, they don't see a value of 0 and think that the
-           root/parent has already set the count to their op number
-           (i.e., 0 is the first op count value). */
-        for (i = 0; i < mca_coll_sm_component.sm_comm_num_in_use_flags; ++i) {
-            ((mca_coll_sm_in_use_flag_t *)base)[i].mcsiuf_operation_count = 1;
-            ((mca_coll_sm_in_use_flag_t *)base)[i].mcsiuf_num_procs_using = 0;
+    if (NULL != sm_module->sm_comm_data->mcb_inter_numa_tree) {
+        /* more than one NUMA domain is in use. turn on memory affinity */
+        ret = ompi_coll_sm_setup_maffinity(sm_module, comm, base);
+        if (OPAL_UNLIKELY(OMPI_SUCCESS != ret)) {
+            opal_output_verbose(ompi_coll_base_framework.framework_output, MCA_BASE_VERBOSE_WARN, "Could not set up memory affinity for coll/sm module. This may reduce performance.");
         }
-        ++j;
+
+        for (int i = 0; i < component->sm_comm_num_segments; ++i) {
+            memset((void *) data->mcb_data_index[i].mcbmi_control, 0,
+                   component->sm_control_size);
+        }
     }
-
-    /* Next, setup pointers to the control and data portions of the
-       segments, as well as to the relevant in-use flags. */
-    base += (c->sm_comm_num_in_use_flags * c->sm_control_size);
-    control_size = size * c->sm_control_size;
-    frag_size = size * c->sm_fragment_size;
-    for (i = 0; i < c->sm_comm_num_segments; ++i) {
-        data->mcb_data_index[i].mcbmi_control = (uint32_t*)
-            (base + (i * (control_size + frag_size)));
-        data->mcb_data_index[i].mcbmi_data =
-            (((char*) data->mcb_data_index[i].mcbmi_control) +
-             control_size);
-
-        /* Memory affinity: control */
-
-        maffinity[j].mbs_len = c->sm_control_size;
-        maffinity[j].mbs_start_addr = (void *)
-            (((char*) data->mcb_data_index[i].mcbmi_control) +
-             (rank * c->sm_control_size));
-        ++j;
-
-        /* Memory affinity: data */
-
-        maffinity[j].mbs_len = c->sm_fragment_size;
-        maffinity[j].mbs_start_addr =
-            ((char*) data->mcb_data_index[i].mcbmi_data) +
-            (rank * c->sm_control_size);
-        ++j;
-    }
-
-    /* Setup memory affinity so that the pages that belong to this
-       process are local to this process */
-    opal_hwloc_base_memory_set(maffinity, j);
-    free(maffinity);
 
     /* Zero out the control structures that belong to this process */
-    memset(data->mcb_barrier_control_me, 0,
-           num_barrier_buffers * 2 * c->sm_control_size);
-    for (i = 0; i < c->sm_comm_num_segments; ++i) {
-        memset((void *) data->mcb_data_index[i].mcbmi_control, 0,
-               c->sm_control_size);
-    }
+    uint32_t *my_barrier_control = mca_coll_sm_barrier_control(data, rank, /*direction=*/0, /*buffer_set=*/0, /*bindex=*/0);
+    memset (my_barrier_control, 0, mca_coll_sm_barrier_buffer_size());
 
-    /* Save previous component's reduce information */
-    sm_module->previous_reduce = comm->c_coll->coll_reduce;
-    sm_module->previous_reduce_module = comm->c_coll->coll_reduce_module;
-    OBJ_RETAIN(sm_module->previous_reduce_module);
-
-    /* Indicate that we have successfully attached and setup */
-    opal_atomic_add (&(data->sm_bootstrap_meta->module_seg->seg_inited), 1);
-
-    /* Wait for everyone in this communicator to attach and setup */
     opal_output_verbose(10, ompi_coll_base_framework.framework_output,
                         "coll:sm:enable (%s/%s): waiting for peers to attach",
                         ompi_comm_print_cid (comm), comm->c_name);
-    SPIN_CONDITION(size == data->sm_bootstrap_meta->module_seg->seg_inited, seg_init_exit);
+    /* Wait for everyone in this communicator to attach and setup */
+    ompi_coll_base_barrier_intra_recursivedoubling(comm, module);
 
-    /* Once we're all here, remove the mmap file; it's not needed anymore */
     if (0 == rank) {
-        unlink(data->sm_bootstrap_meta->shmem_ds.seg_name);
+        opal_shmem_unlink (&data->sm_segment);
         opal_output_verbose(10, ompi_coll_base_framework.framework_output,
                             "coll:sm:enable (%s/%s): removed mmap file %s",
                             ompi_comm_print_cid (comm), comm->c_name,
-                            data->sm_bootstrap_meta->shmem_ds.seg_name);
+                            data->sm_segment.seg_name);
     }
 
-    /* All done */
 
-    opal_output_verbose(10, ompi_coll_base_framework.framework_output,
+    /* All done */
+    opal_output_verbose(MCA_BASE_VERBOSE_COMPONENT, ompi_coll_base_framework.framework_output,
                         "coll:sm:enable (%s/%s): success!",
                         ompi_comm_print_cid (comm), comm->c_name);
+
     return OMPI_SUCCESS;
 }
 
 static int bootstrap_comm(ompi_communicator_t *comm,
                           mca_coll_sm_module_t *module)
 {
-    char *shortpath, *fullpath;
-    mca_coll_sm_component_t *c = &mca_coll_sm_component;
+    mca_coll_sm_component_t *component = &mca_coll_sm_component;
     mca_coll_sm_comm_t *data = module->sm_comm_data;
     int comm_size = ompi_comm_size(comm);
-    int num_segments = c->sm_comm_num_segments;
-    int num_in_use = c->sm_comm_num_in_use_flags;
-    int frag_size = c->sm_fragment_size;
-    int control_size = c->sm_control_size;
-    ompi_process_name_t *lowest_name = NULL;
+    int num_segments = component->sm_comm_num_segments;
+    int num_in_use = component->sm_comm_num_in_use_flags;
+    int frag_size = component->sm_fragment_size;
+    int ret;
     size_t size;
     ompi_proc_t *proc;
-
-    /* Make the rendezvous filename for this communicators shmem data
-       segment.  The CID is not guaranteed to be unique among all
-       procs on this node, so also pair it with the PID of the proc
-       with the lowest PMIx name to form a unique filename. */
-    proc = ompi_group_peer_lookup(comm->c_local_group, 0);
-    lowest_name = OMPI_CAST_RTE_NAME(&proc->super.proc_name);
-    for (int i = 1; i < comm_size; ++i) {
-        proc = ompi_group_peer_lookup(comm->c_local_group, i);
-        if (ompi_rte_compare_name_fields(OMPI_RTE_CMP_ALL,
-                                          OMPI_CAST_RTE_NAME(&proc->super.proc_name),
-                                          lowest_name) < 0) {
-            lowest_name = OMPI_CAST_RTE_NAME(&proc->super.proc_name);
-        }
-    }
-    opal_asprintf(&shortpath, "coll-sm-cid-%s-name-%s.mmap", ompi_comm_print_cid (comm),
-             OMPI_NAME_PRINT(lowest_name));
-    if (NULL == shortpath) {
-        opal_output_verbose(10, ompi_coll_base_framework.framework_output,
-                            "coll:sm:enable:bootstrap comm (%s/%s): asprintf failed",
-                            ompi_comm_print_cid (comm), comm->c_name);
-        return OMPI_ERR_OUT_OF_RESOURCE;
-    }
-    fullpath = opal_os_path(false, ompi_process_info.job_session_dir,
-                            shortpath, NULL);
-    free(shortpath);
-    if (NULL == fullpath) {
-        opal_output_verbose(10, ompi_coll_base_framework.framework_output,
-                            "coll:sm:enable:bootstrap comm (%s/%s): opal_os_path failed",
-                            ompi_comm_print_cid (comm), comm->c_name);
-        return OMPI_ERR_OUT_OF_RESOURCE;
-    }
 
     /* Calculate how much space we need in the per-communicator shmem
        data segment.  There are several values to add:
@@ -559,34 +463,225 @@ static int bootstrap_comm(ompi_communicator_t *comm,
            message: num_segments * (num_procs * frag_size)
      */
 
-    size = 4 * control_size +
-        (num_in_use * control_size) +
-        (num_segments * (comm_size * control_size * 2)) +
+    size = 4 * component->sm_control_size +
+        (num_in_use * component->sm_control_size) +
+        (num_segments * (comm_size * component->sm_control_size * 2)) +
         (num_segments * (comm_size * frag_size));
-    opal_output_verbose(10, ompi_coll_base_framework.framework_output,
-                        "coll:sm:enable:bootstrap comm (%s/%s): attaching to %" PRIsize_t " byte mmap: %s",
-                        ompi_comm_print_cid (comm), comm->c_name, size, fullpath);
     if (0 == ompi_comm_rank (comm)) {
-        data->sm_bootstrap_meta = mca_common_sm_module_create_and_attach (size, fullpath, sizeof(mca_common_sm_seg_header_t), 8);
-        if (NULL == data->sm_bootstrap_meta) {
+        char *fullpath;
+
+        /* Job name plus the unique communicator name are sufficient to ensure no collisions between segment files. */
+        ret = opal_asprintf (&fullpath, "%s" OPAL_PATH_SEP "coll_sm_segment.%x.%s",
+                             component->sm_backing_directory, OMPI_PROC_MY_NAME->jobid, ompi_comm_print_cid(comm));
+        if (ret < 0) {
+            opal_output_verbose(MCA_BASE_VERBOSE_COMPONENT, ompi_coll_base_framework.framework_output,
+                                "coll:sm:enable:bootstrap comm (%s/%s): asprintf failed with code %d",
+                                ompi_comm_print_cid (comm), comm->c_name, ret);
+            return ret;
+        }
+
+        opal_output_verbose(MCA_BASE_VERBOSE_COMPONENT, ompi_coll_base_framework.framework_output,
+                            "coll:sm:enable:bootstrap comm (%s/%s): creating %" PRIsize_t " byte segment: %s",
+                            ompi_comm_print_cid (comm), comm->c_name, size, fullpath);
+        ret = opal_shmem_segment_create (&data->sm_segment, fullpath, size);
+        free(fullpath);
+        if (OPAL_SUCCESS != ret) {
             opal_output_verbose(10, ompi_coll_base_framework.framework_output,
-                "coll:sm:enable:bootstrap comm (%s/%s): mca_common_sm_init_group failed",
+                "coll:sm:enable:bootstrap comm (%s/%s): opal_shmem_segment_create failed",
 				ompi_comm_print_cid (comm), comm->c_name);
-            free(fullpath);
             return OMPI_ERR_OUT_OF_RESOURCE;
         }
 
+        data->sm_segment_base = opal_shmem_segment_attach (&data->sm_segment);
         for (int i = 1 ; i < ompi_comm_size (comm) ; ++i) {
-            MCA_PML_CALL(send(&data->sm_bootstrap_meta->shmem_ds, sizeof (data->sm_bootstrap_meta->shmem_ds), MPI_BYTE,
+            MCA_PML_CALL(send(&data->sm_segment, sizeof (data->sm_segment), MPI_BYTE,
                          i, MCA_COLL_BASE_TAG_BCAST, MCA_PML_BASE_SEND_STANDARD, comm));
         }
     } else {
         opal_shmem_ds_t shmem_ds;
-        MCA_PML_CALL(recv(&shmem_ds, sizeof (shmem_ds), MPI_BYTE, 0, MCA_COLL_BASE_TAG_BCAST, comm, MPI_STATUS_IGNORE));
-        data->sm_bootstrap_meta = mca_common_sm_module_attach (&shmem_ds, sizeof(mca_common_sm_seg_header_t), 8);
+        MCA_PML_CALL(recv(&data->sm_segment, sizeof (data->sm_segment), MPI_BYTE, 0, MCA_COLL_BASE_TAG_BCAST, comm, MPI_STATUS_IGNORE));
+        opal_output_verbose(MCA_BASE_VERBOSE_COMPONENT, ompi_coll_base_framework.framework_output,
+                            "coll:sm:enable:bootstrap comm (%s/%s): attaching to %" PRIsize_t " byte segment: %s",
+                            ompi_comm_print_cid (comm), comm->c_name, size, data->sm_segment.seg_name);
+
+        data->sm_segment_base = opal_shmem_segment_attach (&data->sm_segment);
     }
 
-    /* All done */
-    free(fullpath);
     return OMPI_SUCCESS;
+}
+
+
+/* TODO -- move this code when complete */
+
+static int mca_coll_sm_get_numa_count(void) {
+  int rc = opal_hwloc_base_get_topology();
+  if (OPAL_SUCCESS != rc) {
+    opal_output_verbose(ompi_coll_base_framework.framework_output, MCA_BASE_VERBOSE_WARN, "mca_coll_sm_get_numa_count: could not get hwloc topology. assuming a single NUMA domain");
+    return 1;
+  }
+
+  return opal_hwloc_base_get_nbobjs_by_type(opal_hwloc_topology, HWLOC_OBJ_NUMANODE, /*cache_level=*/0, OPAL_HWLOC_AVAILABLE);
+}
+
+static int mca_coll_sm_get_my_numa(void) {
+  int numa_count = mca_coll_sm_get_numa_count();
+
+  if (2 > numa_count) {
+    return 0;
+  }
+
+  hwloc_nodeset_t node_set = hwloc_bitmap_alloc();
+  hwloc_cpuset_to_nodeset(opal_hwloc_topology, opal_hwloc_my_cpuset, node_set);
+  int my_numa = hwloc_bitmap_first(node_set);
+  if (hwloc_bitmap_last(node_set) != my_numa) {
+    opal_output_verbose(ompi_coll_base_framework.framework_output, MCA_BASE_VERBOSE_WARN, "mca_coll_sm_get_my_numa: process is bound to multiple numa domains. disabling NUMA-aware optimizations");
+    my_numa = -1;
+  }
+  hwloc_bitmap_free(node_set);
+  return my_numa;
+}
+
+static int *mca_coll_sm_get_numa_mapping_for_comm(ompi_communicator_t *comm) {
+  int *mapping;
+
+  mapping = calloc (ompi_comm_size(comm), sizeof (int));
+  if (OPAL_UNLIKELY(NULL == mapping)) {
+    opal_output_verbose(ompi_coll_base_framework.framework_output, MCA_BASE_VERBOSE_WARN, "mca_coll_sm_get_numa_mapping: could not allocate memory for NUMA mapping");
+    return NULL;
+  }
+
+  mapping[ompi_comm_rank(comm)] = mca_coll_sm_get_my_numa();
+
+  int rc = comm->c_coll->coll_allgather(MPI_IN_PLACE, 1, MPI_INT, mapping, 1, MPI_INT, comm, comm->c_coll->coll_allgather_module);
+  if (OMPI_SUCCESS != rc) {
+    opal_output_verbose(ompi_coll_base_framework.framework_output, MCA_BASE_VERBOSE_WARN, "mca_coll_sm_get_numa_mapping: allgather of NUMA info failed. disabling NUMA-aware optimizations");
+    free(mapping);
+    return NULL;
+  }
+
+  return mapping;
+}
+
+static mca_coll_sm_tree_t *mca_coll_sm_get_tree(ompi_communicator_t *comm, int *ranks, int rank_count, int degree) {
+    if (0 == degree || 0 == rank_count) {
+        return NULL;
+    }
+
+    unsigned char *tree_buffer = calloc (1, sizeof (mca_coll_sm_tree_t) + rank_count * (sizeof (mca_coll_sm_tree_node_t) + sizeof (mca_coll_sm_tree_node_t *)));
+
+    mca_coll_sm_tree_t *tree = (mca_coll_sm_tree_t *) tree_buffer;
+    mca_coll_sm_tree_node_t *root = (mca_coll_sm_tree_node_t *) (tree + 1);
+    mca_coll_sm_tree_node_t **children = (mca_coll_sm_tree_node_t **) (root + rank_count);
+    int my_rank = ompi_comm_rank(comm);
+
+    tree->my_tree_rank = -1;
+    tree->node_count = rank_count;
+
+    for (int level = 0, node_index = 0, nodes_at_level = 1, first_child_index = 1 ; node_index < rank_count ; ++level) { 
+        int remaining_processes = rank_count - node_index;
+
+        if (remaining_processes < nodes_at_level) {
+            nodes_at_level = remaining_processes;
+        }
+
+
+        int total_left = rank_count - node_index - nodes_at_level;
+        int max_nodes_at_next_level = nodes_at_level * degree;
+        int nodes_at_next_level = opal_min(max_nodes_at_next_level, total_left);
+
+        int next_level_nodes = nodes_at_next_level;
+        
+        for (int node = 0, child_count = nodes_at_next_level ; node < nodes_at_level ; ++node, ++node_index) {
+            mca_coll_sm_tree_node_t *tree_node = root + node_index;
+ 
+            /* balance the nodes */
+            int children_per_node = (nodes_at_next_level + nodes_at_level - node - 1) / (nodes_at_level - node);
+            
+            if (my_rank == ranks[node_index]) {
+                tree->my_tree_rank = node_index;
+            }
+
+            tree_node->mcstn_id = ranks[node_index];
+            tree_node->mcstn_children = children;
+            tree_node->mcstn_num_children = opal_min(nodes_at_next_level, children_per_node);
+
+            nodes_at_next_level -= tree_node->mcstn_num_children;
+            children += tree_node->mcstn_num_children;
+            for (int child = 0 ; child < tree_node->mcstn_num_children ; ++child, ++first_child_index) {
+                tree_node->mcstn_children[child] = root + first_child_index;
+                tree_node->mcstn_children[child]->mcstn_parent = tree_node;
+            }
+        }
+
+        nodes_at_level = next_level_nodes;
+    }
+
+    return tree;
+}
+
+static int mca_coll_sm_generate_numa_trees(mca_coll_sm_module_t *sm_module, ompi_communicator_t *comm, int degree) {
+  int comm_size = ompi_comm_size(comm);
+  int comm_rank = ompi_comm_rank(comm);
+  int numa_count = mca_coll_sm_get_numa_count();
+  int *numa_array = alloca(sizeof(int) * comm_size);
+  int *leader_array = alloca(sizeof(int) * numa_count);
+  int *numa_counts = alloca(sizeof(int) * numa_count);
+  int *mapping = mca_coll_sm_get_numa_mapping_for_comm(comm);
+  int leaders = 1;
+
+  if (NULL == mapping || numa_count == 1) {
+      /* could not get a mapping or single numa. treat this like the single numa case */
+      for (int i = 0 ; i < comm_size ; ++i) {
+          numa_array[i] = i;
+      }
+
+      sm_module->sm_comm_data->mcb_intra_numa_tree = mca_coll_sm_get_tree(comm, numa_array, comm_size, degree);
+      sm_module->sm_comm_data->mcb_inter_numa_tree = NULL;
+
+      return OMPI_SUCCESS;
+  }
+
+  memset(numa_counts, 0, sizeof(numa_counts[0]) * numa_count);
+
+  int numa_rank_count = 0, leader_count = 0, my_numa = mapping[comm_rank];
+  for (int i = 0 ; i < comm_size ; ++i) {
+    if (mapping[i] == my_numa) {
+      numa_array[numa_rank_count++] = i;
+    }
+    if (numa_counts[mapping[i]]++ == 0) {
+      leader_array[leader_count++] = i;
+    }
+  }
+
+  free(mapping);
+
+  if (leader_count > 1) {
+      sm_module->sm_comm_data->mcb_inter_numa_tree = mca_coll_sm_get_tree(comm, leader_array, leader_count, degree);
+  } else {
+      sm_module->sm_comm_data->mcb_inter_numa_tree = NULL;
+  }
+
+  sm_module->sm_comm_data->mcb_intra_numa_tree = mca_coll_sm_get_tree(comm, numa_array, numa_rank_count, degree);
+  return OMPI_SUCCESS;
+}
+
+static void mca_coll_sm_print_tree(const mca_coll_sm_tree_t *tree) {
+    if (0 != tree->my_tree_rank) {
+        return;
+    }
+
+    static int foo=1;
+    if (foo==0) {
+        return;
+    }
+    foo=0;
+
+    for (int i = 0 ; i < tree->node_count ; ++i) {
+        const mca_coll_sm_tree_node_t *node = tree->nodes + i;
+        printf ("Node %d: rank=%d, child_count=%d, parent=%d\n", i, node->mcstn_id, node->mcstn_num_children, node->mcstn_parent ? node->mcstn_parent->mcstn_id : -1);
+        printf ("  Children: \n");
+        for (int j = 0 ; j < node->mcstn_num_children ; ++j) {
+            printf ("    %d\n", node->mcstn_children[j]->mcstn_id);
+        }
+    }
 }

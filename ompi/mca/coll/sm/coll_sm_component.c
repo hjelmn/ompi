@@ -34,6 +34,7 @@
 #include "opal/util/printf.h"
 #include "ompi/constants.h"
 #include "ompi/mca/coll/coll.h"
+#include "ompi/runtime/ompi_rte.h"
 #include "coll_sm.h"
 
 
@@ -223,9 +224,9 @@ static int sm_register(void)
                                            MCA_BASE_VAR_SCOPE_READONLY,
                                            &cs->sm_comm_num_segments);
 
-    cs->sm_tree_degree = 4;
+    cs->sm_tree_degree = 8;
     (void) mca_base_component_var_register(c, "tree_degree",
-                                           "Degree of the tree for tree-based operations (must be => 1 and <= min(control_size, 255))",
+                                           "Degree of the tree for tree-based operations (must be >= 1 and <= min(control_size, 255))",
                                            MCA_BASE_VAR_TYPE_INT, NULL, 0, 0,
                                            OPAL_INFO_LVL_9,
                                            MCA_BASE_VAR_SCOPE_READONLY,
@@ -254,6 +255,19 @@ static int sm_register(void)
                                            OPAL_INFO_LVL_9,
                                            MCA_BASE_VAR_SCOPE_READONLY,
                                            &coll_sm_shared_mem_used_data);
+
+    if (0 == access ("/dev/shm", W_OK)) {
+        cs->sm_backing_directory = "/dev/shm";
+    } else {
+        cs->sm_backing_directory = ompi_process_info.proc_session_dir;
+    }
+
+    (void) mca_base_component_var_register (c, "backing_directory",
+                                            "Directory to place backing files for shared memory collectives. "
+                                            "This directory should be on a local filesystem such as /tmp or "
+                                            "/dev/shm (default: (linux) /dev/shm, (others) session directory)",
+                                            MCA_BASE_VAR_TYPE_STRING, NULL, 0, 0, OPAL_INFO_LVL_3,
+                                            MCA_BASE_VAR_SCOPE_READONLY, &cs->sm_backing_directory);
 
     return sm_verify_mca_variables();
 }
