@@ -1,0 +1,9 @@
+# (c) Google, LLC. All rights reserved.
+
+enable_mem_debug=no
+enable_mem_profile=no
+enable_debug_symbols=no
+enable_picky=no
+enable_debug=no
+with_valgrind=no
+enable_memchecker=no
