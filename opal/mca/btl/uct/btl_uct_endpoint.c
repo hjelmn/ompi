@@ -258,8 +258,8 @@ static int mca_btl_uct_endpoint_send_conn_req(mca_btl_uct_module_t *uct_btl,
 }
 
 static int mca_btl_uct_endpoint_connect_endpoint(
-    mca_btl_uct_module_t *uct_btl, mca_btl_base_endpoint_t *endpoint, mca_btl_uct_tl_t *tl,
-    mca_btl_uct_device_context_t *tl_context, mca_btl_uct_tl_endpoint_t *tl_endpoint,
+    mca_btl_uct_module_t *uct_btl, mca_btl_uct_module_t *conn_module, mca_btl_base_endpoint_t *endpoint,
+    mca_btl_uct_tl_t *tl, mca_btl_uct_device_context_t *tl_context, mca_btl_uct_tl_endpoint_t *tl_endpoint,
     uint8_t *tl_data, uint8_t *conn_tl_data, void *ep_addr)
 {
     size_t request_length = sizeof(mca_btl_uct_conn_req_t)
@@ -363,6 +363,36 @@ static int mca_btl_uct_endpoint_connect_endpoint(
                                                                        : OPAL_ERR_OUT_OF_RESOURCE;
 }
 
+static int mca_btl_uct_find_modex(mca_btl_uct_module_t *uct_btl, mca_btl_uct_modex_t *modex,
+                                  uint8_t **rdma_tl_data, uint8_t **am_tl_data, uint8_t **conn_tl_data) {
+    uint8_t *modex_data = modex->data;
+
+    /* look for matching transport in the modex */
+    for (int i = 0; i < modex->module_count; ++i) {
+        uint32_t modex_size = *((uint32_t *) modex_data);
+
+        BTL_VERBOSE(("found modex for md %s, searching for %s", modex_data + 4, uct_btl->md_name));
+
+        modex_data += 4;
+
+        if (0 != strcmp((char *) modex_data, uct_btl->md_name)) {
+            /* modex belongs to a different module, skip it and continue */
+            modex_data += modex_size - 4;
+            continue;
+        }
+
+        modex_data += strlen((char *) modex_data) + 1;
+
+        mca_btl_uct_process_modex(uct_btl, modex_data, rdma_tl_data, am_tl_data, conn_tl_data);
+
+        return OPAL_SUCCESS;
+    }
+
+    BTL_ERROR(("could not find modex for %s", uct_btl->md_name));
+
+    return OPAL_ERR_NOT_FOUND;
+}
+
 int mca_btl_uct_endpoint_connect(mca_btl_uct_module_t *uct_btl, mca_btl_uct_endpoint_t *endpoint,
                                  int context_id, void *ep_addr, int tl_index)
 {
@@ -375,7 +405,6 @@ int mca_btl_uct_endpoint_connect(mca_btl_uct_module_t *uct_btl, mca_btl_uct_endp
     uint8_t *rdma_tl_data = NULL, *conn_tl_data = NULL, *am_tl_data = NULL, *tl_data;
     mca_btl_uct_connection_ep_t *conn_ep = NULL;
     mca_btl_uct_modex_t *modex;
-    uint8_t *modex_data;
     size_t msg_size;
     int rc;
 
@@ -415,43 +444,36 @@ int mca_btl_uct_endpoint_connect(mca_btl_uct_module_t *uct_btl, mca_btl_uct_endp
         BTL_VERBOSE(("received modex of size %lu for proc %s. module count %d",
                      (unsigned long) msg_size, OPAL_NAME_PRINT(endpoint->ep_proc->proc_name),
                      modex->module_count));
-        modex_data = modex->data;
 
-        /* look for matching transport in the modex */
-        for (int i = 0; i < modex->module_count; ++i) {
-            uint32_t modex_size = *((uint32_t *) modex_data);
+        rc = mca_btl_uct_find_modex (uct_btl, modex, &rdma_tl_data, &am_tl_data, &conn_tl_data);
 
-            BTL_VERBOSE(
-                ("found modex for md %s, searching for %s", modex_data + 4, uct_btl->md_name));
-
-            modex_data += 4;
-
-            if (0 != strcmp((char *) modex_data, uct_btl->md_name)) {
-                /* modex belongs to a different module, skip it and continue */
-                modex_data += modex_size - 4;
-                continue;
-            }
-
-            modex_data += strlen((char *) modex_data) + 1;
-
-            mca_btl_uct_process_modex(uct_btl, modex_data, &rdma_tl_data, &am_tl_data,
-                                      &conn_tl_data);
+        if (OPAL_UNLIKELY(OPAL_SUCCESS != rc)) {
             break;
         }
 
         tl_data = (tl == uct_btl->rdma_tl) ? rdma_tl_data : am_tl_data;
-
-        if (NULL == tl_data) {
-            opal_mutex_unlock(&endpoint->ep_lock);
-            return OPAL_ERR_UNREACH;
+        if (OPAL_UNLIKELY(NULL == tl_data)) {
+            BTL_ERROR(("could not find modex data for this transport"));
+            break;
         }
 
         /* connect the endpoint */
-        if (!mca_btl_uct_tl_requires_connection_tl(tl)) {
-            rc = mca_btl_uct_endpoint_connect_iface(uct_btl, tl, tl_context, tl_endpoint, tl_data);
-        } else {
-            rc = mca_btl_uct_endpoint_connect_endpoint(uct_btl, endpoint, tl, tl_context,
+        if (mca_btl_uct_tl_requires_connection_tl(tl)) {
+            mca_btl_uct_module_t *conn_module = uct_btl;
+            if (NULL == uct_btl->conn_tl) {
+                rc = mca_btl_uct_find_modex (mca_btl_uct_component.conn_module, /*rdma_tl_data=*/NULL,
+                                             /*am_tl_data=*/NULL, &conn_tl_data);
+                if (OPAL_UNLIKLEY(OPAL_SUCCESS != rc)) {
+                    BTL_ERROR(("could not find modex for connection module"));
+                    break;
+                }
+                conn_module = mca_btl_uct_component.conn_module;
+            }
+
+            rc = mca_btl_uct_endpoint_connect_endpoint(uct_btl, conn_module, endpoint, tl, tl_context,
                                                        tl_endpoint, tl_data, conn_tl_data, ep_addr);
+        } else {
+            rc = mca_btl_uct_endpoint_connect_iface(uct_btl, tl, tl_context, tl_endpoint, tl_data);
         }
 
     } while (0);
@@ -469,7 +491,11 @@ int mca_btl_uct_endpoint_connect(mca_btl_uct_module_t *uct_btl, mca_btl_uct_endp
         OBJ_RELEASE(conn_ep);
     }
 
-    BTL_VERBOSE(("endpoint%s ready for use", (OPAL_ERR_OUT_OF_RESOURCE != rc) ? "" : " not yet"));
+    if (OPAL_LIKELY(OPAL_ERR_OUT_OF_RESOURCE == rc || OPAL_SUCCESS == rc)) {
+        BTL_VERBOSE(("endpoint%s ready for use", (OPAL_ERR_OUT_OF_RESOURCE != rc) ? "" : " not yet"));
+    } else {
+        BTL_ERROR(("unable to connect endpoint, rc=%d", rc));
+    }
 
     return rc;
 }

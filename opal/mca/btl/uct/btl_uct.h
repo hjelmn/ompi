@@ -153,6 +153,10 @@ struct mca_btl_uct_component_t {
 
     /** disable UCX memory hooks */
     bool disable_ucx_memory_hooks;
+
+    /** alternate connection-only module that can be used if no suitable
+     * connection tl is found. this is usually a tcp tl. */
+    mca_btl_uct_module_t *conn_module;
 };
 typedef struct mca_btl_uct_component_t mca_btl_uct_component_t;
 
@@ -289,7 +293,8 @@ struct mca_btl_base_endpoint_t *mca_btl_uct_get_ep(struct mca_btl_base_module_t 
                                                    opal_proc_t *proc);
 
 int mca_btl_uct_query_tls(mca_btl_uct_module_t *module, mca_btl_uct_md_t *md,
-                          uct_tl_resource_desc_t *tl_descs, unsigned tl_count);
+                          uct_tl_resource_desc_t *tl_descs, unsigned tl_count,
+                          bool evaluate_for_conn_only);
 int mca_btl_uct_process_connection_request(mca_btl_uct_module_t *module,
                                            mca_btl_uct_conn_req_t *req);
 

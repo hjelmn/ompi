@@ -563,7 +563,8 @@ static int mca_btl_uct_evaluate_tl(mca_btl_uct_module_t *module, mca_btl_uct_tl_
 }
 
 int mca_btl_uct_query_tls(mca_btl_uct_module_t *module, mca_btl_uct_md_t *md,
-                          uct_tl_resource_desc_t *tl_descs, unsigned tl_count)
+                          uct_tl_resource_desc_t *tl_descs, unsigned tl_count,
+                          bool evaluate_for_conn_only)
 {
     bool include = true, any = false;
     mca_btl_uct_tl_t *tl;
@@ -593,27 +594,32 @@ int mca_btl_uct_query_tls(mca_btl_uct_module_t *module, mca_btl_uct_md_t *md,
         }
     }
 
-    if (any && !include) {
+    if (any && !include && !evaluate_for_conn_only) {
         opal_argv_free(tl_filter);
         return OPAL_ERR_NOT_AVAILABLE;
     }
 
     for (unsigned i = 0; i < tl_count; ++i) {
-        bool try_tl = any;
-        int priority = any_priority;
+        if (!evaluate_for_conn_only) {
+            bool try_tl = any;
+            int priority = any_priority;
 
-        for (unsigned j = 0; tl_filter[j]; ++j) {
-            if (0 == strcmp(tl_filter[j], tl_descs[i].tl_name)) {
-                try_tl = include;
-                priority = j;
-                break;
+            for (unsigned j = 0; tl_filter[j]; ++j) {
+                if (0 == strcmp(tl_filter[j], tl_descs[i].tl_name)) {
+                    try_tl = include;
+                    priority = j;
+                    break;
+                }
             }
-        }
 
-        BTL_VERBOSE(("tl filter: tl_name = %s, use = %d, priority = %d", tl_descs[i].tl_name,
-                     try_tl, priority));
+            BTL_VERBOSE(("tl filter: tl_name = %s, use = %d, priority = %d", tl_descs[i].tl_name,
+                         try_tl, priority));
 
-        if (!try_tl) {
+            if (!try_tl) {
+                continue;
+            }
+        } else if (tl_descs[i].dev_type != UCT_DEVICE_TYPE_NET) {
+            /* only network types are suitable for forming connections */
             continue;
         }
 
@@ -626,7 +632,20 @@ int mca_btl_uct_query_tls(mca_btl_uct_module_t *module, mca_btl_uct_md_t *md,
         tl = mca_btl_uct_create_tl(module, md, tl_descs + i, priority);
 
         if (tl) {
-            opal_list_append(&tl_list, &tl->super);
+            if (evaluate_for_conn_only) {
+                if (mca_btl_uct_tl_supports_conn(tl)) {
+                    BTL_VERBOSE(("evaluating tl %s for forming connections", tl_descs[i].tl_name));
+                    rc = mca_btl_uct_set_tl_conn(module, tl);
+                    if (OPAL_SUCCESS == rc) {
+                        OBJ_DESTRUCT(&tl_list);
+                        return OPAL_SUCCESS;
+                    }
+                    BTL_VERBOSE(("tl %s an not be used for forming connections", tl_descs[i].tl_name));
+                }
+                OBJ_RELEASE(tl);
+            } else {
+                opal_list_append(&tl_list, &tl->super);
+            }
         }
     }
 
@@ -680,10 +699,6 @@ int mca_btl_uct_query_tls(mca_btl_uct_module_t *module, mca_btl_uct_md_t *md,
         /* no connection tl needed for selected transports */
         OBJ_RELEASE(module->conn_tl);
         module->conn_tl = NULL;
-    } else if (NULL == module->conn_tl) {
-        BTL_VERBOSE(("a connection tl is required but no tls match the filter %s",
-                     mca_btl_uct_component.allowed_transports));
-        return OPAL_ERROR;
     }
 
     return OPAL_SUCCESS;

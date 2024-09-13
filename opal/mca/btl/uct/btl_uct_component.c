@@ -156,6 +156,11 @@ static int mca_btl_uct_component_open(void)
  */
 static int mca_btl_uct_component_close(void)
 {
+    if (NULL != mca_btl_uct_component.conn_module) {
+        OBJ_RELEASE(mca_btl_uct_component.conn_module);
+        mca_btl_uct_component.conn_module = NULL;
+    }
+
     if (mca_btl_uct_component.disable_ucx_memory_hooks) {
         opal_mem_hooks_unregister_release(mca_btl_uct_mem_release_cb);
     }
@@ -235,10 +240,17 @@ static int mca_btl_uct_modex_send(void)
         modex_size += mca_btl_uct_module_modex_size(mca_btl_uct_component.modules[i]);
     }
 
+    if (mca_btl_uct_component.conn_module != NULL) {
+        modex_size += mca_btl_uct_module_modex_size(mca_btl_uct_component.conn_module);
+    }
+
     modex = alloca(modex_size);
     modex_data = modex->data;
 
     modex->module_count = mca_btl_uct_component.module_count;
+    if (mca_btl_uct_component.conn_module != NULL) {
+        ++modex->module_count;
+    }
 
     for (int i = 0; i < mca_btl_uct_component.module_count; ++i) {
         mca_btl_uct_module_t *module = mca_btl_uct_component.modules[i];
@@ -264,6 +276,10 @@ static int mca_btl_uct_modex_send(void)
             && module->conn_tl != module->am_tl) {
             modex_data += mca_btl_uct_tl_modex_pack(module->conn_tl, modex_data);
         }
+    }
+
+    if (mca_btl_uct_component.conn_module != NULL) {
+        modex_data += mca_btl_uct_tl_modex_pack(mca_btl_uct_component.conn_module->conn_tl, modex_data);
     }
 
     OPAL_MODEX_SEND(rc, PMIX_GLOBAL, &mca_btl_uct_component.super.btl_version, modex, modex_size);
@@ -365,7 +381,7 @@ static int mca_btl_uct_component_process_uct_md(uct_md_resource_desc_t *md_desc,
         }
     }
 
-    if (!found) {
+    if (!found && NULL != mca_btl_uct_component.conn_module) {
         /* nothing to do */
         return OPAL_SUCCESS;
     }
@@ -414,7 +430,9 @@ static int mca_btl_uct_component_process_uct_md(uct_md_resource_desc_t *md_desc,
         return OPAL_ERR_OUT_OF_RESOURCE;
     }
 
-    (void) mca_btl_uct_query_tls(module, md, tl_desc, num_tls);
+    /* if this module is not to be used for communication check if it has a transport suitable 
+     * for forming connections. */
+    (void) mca_btl_uct_query_tls(module, md, tl_desc, num_tls, /*evaluate_for_conn_only=*/!found);
 
     uct_release_tl_resource_list(tl_desc);
 
@@ -432,27 +450,31 @@ static int mca_btl_uct_component_process_uct_md(uct_md_resource_desc_t *md_desc,
     module->uct_component = component;
 #endif
 
-    mca_btl_uct_component.modules[mca_btl_uct_component.module_count++] = module;
+    if (found) {
+        mca_btl_uct_component.modules[mca_btl_uct_component.module_count++] = module;
 
-    /* NTH: a registration cache shouldn't be necessary when using UCT but there are measurable
-     * performance benefits to using rcache/grdma instead of assuming UCT will do the right
-     * thing. */
-    (void) opal_asprintf(&tmp, "uct.%s", module->md_name);
+        /* NTH: a registration cache shouldn't be necessary when using UCT but there are measurable
+         * performance benefits to using rcache/grdma instead of assuming UCT will do the right
+         * thing. */
+        (void) opal_asprintf(&tmp, "uct.%s", module->md_name);
 
-    rcache_resources.cache_name = tmp;
-    rcache_resources.reg_data = (void *) module;
-    rcache_resources.sizeof_reg = sizeof(mca_btl_uct_reg_t)
-                                  + module->super.btl_registration_handle_size;
-    rcache_resources.register_mem = mca_btl_uct_reg_mem;
-    rcache_resources.deregister_mem = mca_btl_uct_dereg_mem;
+        rcache_resources.cache_name = tmp;
+        rcache_resources.reg_data = (void *) module;
+        rcache_resources.sizeof_reg = sizeof(mca_btl_uct_reg_t)
+            + module->super.btl_registration_handle_size;
+        rcache_resources.register_mem = mca_btl_uct_reg_mem;
+        rcache_resources.deregister_mem = mca_btl_uct_dereg_mem;
 
-    module->rcache = mca_rcache_base_module_create("grdma", module, &rcache_resources);
-    free(tmp);
-    if (NULL == module->rcache) {
-        /* something when horribly wrong */
-        BTL_VERBOSE(("could not allocate a registration cache for this btl module"));
-        mca_btl_uct_finalize(&module->super);
-        return OPAL_ERROR;
+        module->rcache = mca_rcache_base_module_create("grdma", module, &rcache_resources);
+        free(tmp);
+        if (NULL == module->rcache) {
+            /* something when horribly wrong */
+            BTL_VERBOSE(("could not allocate a registration cache for this btl module"));
+            mca_btl_uct_finalize(&module->super);
+            return OPAL_ERROR;
+        }
+    } else {
+        mca_btl_uct_component.conn_module = module;
     }
 
     return OPAL_SUCCESS;
@@ -493,6 +515,63 @@ static int mca_btl_uct_component_process_uct_component(uct_component_h component
     return OPAL_SUCCESS;
 }
 #endif /* UCT_API >= UCT_VERSION(1, 7) */
+
+static void mca_btl_uct_component_validate_modules(void) {
+    if (mca_btl_uct_component.conn_module != NULL) {
+        /* verify that a connection-only module is required. this might be the case in some systems
+         * where rc verbs is avaiable but ud is not. */
+        bool need_conn_module = false;
+        for (int i = 0 ; i < mca_btl_uct_component.module_count ; ++i) {
+            mca_btl_uct_module_t *module =  mca_btl_uct_component.modules[i];
+            if (module->conn_tl != NULL) {
+                continue;
+            }
+            if ((module->dma_tl && mca_btl_uct_tl_requires_connection_tl(module->dma_tl)) ||
+                (module->am_tl && mca_btl_uct_tl_requires_connection_tl(module->am_tl))) {
+                need_conn_module = true;
+                break;
+            }
+        }
+
+        if (!need_conn_module) {
+            OBJ_RELEASE(mca_btl_uct_component.conn_module);
+            mca_btl_uct_component.conn_module = NULL;
+        }
+    } else {
+        int usable_module_count = mca_btl_uct_component.module_count;
+
+        /* check that all modules can be used */
+        for (int i = 0 ; i < mca_btl_uct_component.module_count ; ++i) {
+            mca_btl_uct_module_t *module =  mca_btl_uct_component.modules[i];
+            if (NULL != module->conn_tl) {
+                /* module has its own connection transport */
+                continue;
+            }
+
+            if ((module->dma_tl && mca_btl_uct_tl_requires_connection_tl(module->dma_tl)) ||
+                (module->am_tl && mca_btl_uct_tl_requires_connection_tl(module->am_tl))
+                && NULL == module->conn_tl) {
+                /* module can not be used */
+                BTL_VERBOSE(("module for memory domain %s can not be used due to missing connection transport",
+                             module->md_name));
+                OBJ_RELEASE(module);
+                mca_btl_uct_component.modules[i] = NULL;
+            }
+        }
+
+        /* remove holes in the module array */
+        if (usable_module_count < mca_btl_uct_component.module_count) {
+            for (int i = 0 ; i < mca_btl_uct_component.module_count ; ++i) {
+                if (mca_btl_uct_component.modules[i] == NULL) {
+                    for (int j = i ; j < mca_btl_uct_component.module_count ; ++j) {
+                        mca_btl_uct_component.modules[i++] = mca_btl_uct_component.modules[j];
+                    }
+                }
+            }
+            mca_btl_uct_component.module_count = usable_module_count;
+        }
+    }
+}
 
 /*
  *  UCT component initialization:
@@ -568,6 +647,10 @@ static mca_btl_base_module_t **mca_btl_uct_component_init(int *num_btl_modules,
 #endif /* UCT_API >= UCT_VERSION(1, 7) */
 
     opal_argv_free(allowed_ifaces);
+
+    /* filter out unusable modules before sending the modex */
+    mca_btl_uct_component_validate_modules();
+
     mca_btl_uct_modex_send();
 
     /* pass module array back to caller */
