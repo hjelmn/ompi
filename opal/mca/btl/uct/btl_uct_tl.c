@@ -273,21 +273,6 @@ mca_btl_uct_device_context_t *mca_btl_uct_context_create(mca_btl_uct_module_t *m
                                                          mca_btl_uct_tl_t *tl, int context_id,
                                                          bool enable_progress)
 {
-#if UCT_API >= UCT_VERSION(1, 6)
-    uct_iface_params_t iface_params = {.field_mask = UCT_IFACE_PARAM_FIELD_OPEN_MODE
-                                                     | UCT_IFACE_PARAM_FIELD_DEVICE,
-                                       .open_mode = UCT_IFACE_OPEN_MODE_DEVICE,
-                                       .mode = {.device = {.tl_name = tl->uct_tl_name,
-                                                           .dev_name = tl->uct_dev_name}}};
-#else
-    uct_iface_params_t iface_params = {.rndv_cb = NULL,
-                                       .eager_cb = NULL,
-                                       .stats_root = NULL,
-                                       .rx_headroom = 0,
-                                       .open_mode = UCT_IFACE_OPEN_MODE_DEVICE,
-                                       .mode = {.device = {.tl_name = tl->uct_tl_name,
-                                                           .dev_name = tl->uct_dev_name}}};
-#endif
     mca_btl_uct_device_context_t *context;
     ucs_status_t ucs_status;
     int rc;
@@ -322,18 +307,10 @@ mca_btl_uct_device_context_t *mca_btl_uct_context_create(mca_btl_uct_module_t *m
         return NULL;
     }
 
-    ucs_status = uct_iface_open(tl->uct_md->uct_md, context->uct_worker, &iface_params,
+    ucs_status = uct_iface_open(tl->uct_md->uct_md, context->uct_worker, &tl->iface_params,
                                 tl->uct_tl_config, &context->uct_iface);
     if (OPAL_UNLIKELY(UCS_OK != ucs_status)) {
         BTL_VERBOSE(("could not open UCT interface. error code: %d", ucs_status));
-        mca_btl_uct_context_destroy(context);
-        return NULL;
-    }
-
-    /* only need to query one of the interfaces to get the attributes */
-    ucs_status = uct_iface_query(context->uct_iface, &context->uct_iface_attr);
-    if (UCS_OK != ucs_status) {
-        BTL_VERBOSE(("Error querying UCT interface"));
         mca_btl_uct_context_destroy(context);
         return NULL;
     }

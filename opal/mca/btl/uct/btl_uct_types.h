@@ -68,6 +68,12 @@ struct mca_btl_uct_md_t {
 
     /** UCT memory domain handle */
     uct_md_h uct_md;
+
+    /** Description of this memory domain */
+    uct_md_resource_desc_t desc;
+
+    /** List of tls (mca_btl_uct_tl_t) */
+    opal_list_t tls;
 };
 
 typedef struct mca_btl_uct_md_t mca_btl_uct_md_t;
@@ -152,10 +158,7 @@ struct mca_btl_uct_device_context_t {
 
     /** UCT interface handle */
     uct_iface_h uct_iface;
-
-    /** interface attributes */
-    uct_iface_attr_t uct_iface_attr;
-
+x
     /** RDMA completions */
     opal_free_list_t rdma_completions;
 
@@ -329,8 +332,14 @@ struct mca_btl_uct_tl_t {
     int max_device_contexts;
 
     /** array of device contexts */
-    mca_btl_uct_device_context_t **uct_dev_contexts;
+    mca_btl_uct_device_context_t *uct_dev_contexts[MCA_BTL_UCT_MAX_WORKERS];
 
+    /** interface attributes */
+    uct_iface_attr_t uct_iface_attr;
+
+    /** parameters to use when creating a context */
+    uct_iface_params_t iface_params;
+    
     /** tl index. this is used to differentiate (if there is any difference)
      * between rdma and am endpoints */
     int tl_index;
@@ -339,7 +348,7 @@ struct mca_btl_uct_tl_t {
 typedef struct mca_btl_uct_tl_t mca_btl_uct_tl_t;
 OBJ_CLASS_DECLARATION(mca_btl_uct_tl_t);
 
-#    define MCA_BTL_UCT_TL_ATTR(tl, context_id) (tl)->uct_dev_contexts[(context_id)]->uct_iface_attr
+#    define MCA_BTL_UCT_TL_ATTR(tl, unused) (tl)->uct_iface_attr
 
 struct mca_btl_uct_pending_connection_request_t {
     opal_list_item_t super;

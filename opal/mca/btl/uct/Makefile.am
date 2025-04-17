@@ -39,7 +39,8 @@ sources = \
     btl_uct_frag.c \
     btl_uct_tl.c \
     btl_uct_types.h \
-    btl_uct_device_context.h
+    btl_uct_device_context.h \
+    btl_uct_discover.c
 
 # Make the output library in this directory, and name it either
 # mca_<type>_<name>.la (for DSO builds) or libmca_<type>_<name>.la
